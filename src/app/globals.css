@@ -1,0 +1,186 @@
+/* ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ */
+/* 04515 — Global Styles                                              */
+/* The void of cyberspace                                                */
+/* ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Emoji in every font stack: Apple's on a Mac, else the self-hosted Noto (oasis-emoji.css; Windows 10's own
+     emoji font has no newer emoji), then the system ones. Inline stacks use var(--oasis-emoji) before their generic. */
+  --oasis-emoji: "Apple Color Emoji", "Oasis Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Segoe UI Symbol";
+  --prefrontal: #8B5CF6;
+  --coder: #F97316;
+  --reviewer: #3B82F6;
+  --tester: #22C55E;
+  --hacker: #EF4444;
+  --void: #000000;
+  --glow: #A855F7;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--void);
+  color: white;
+  font-family: 'Courier New', var(--oasis-emoji), monospace;
+}
+
+/* Canvas takes full screen */
+#uploader-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* UI overlays */
+.ui-overlay {
+  position: fixed;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.ui-overlay > * {
+  pointer-events: auto;
+}
+
+/* ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ */
+/* OASIS FANCY FRAME — border-image from the GPT-image-2 panel-borders     */
+/* alpha atlas. Drop `oasis-fancy-frame` on any panel root and pad to       */
+/* avoid clipping the content under the ornate corners. The slice values   */
+/* are tuned for the 671×494 extracted PNG; corner ornaments sit ~110px    */
+/* in from each edge, leaving the middle edges to repeat.                  */
+/*                                                                         */
+/* Usage:                                                                  */
+/*   <div className="oasis-fancy-frame">…</div>                            */
+/* ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ */
+.oasis-fancy-frame {
+  border-style: solid;
+  border-width: 56px;
+  border-color: transparent;
+  border-image-source: url('/ui/textures-extracted/borders/rect-frame-large.png');
+  border-image-slice: 110 fill;
+  border-image-width: 56px;
+  border-image-outset: 0;
+  border-image-repeat: stretch;
+  /* The fill keyword paints the central slice over the element background,
+     so the rest of the rectangle is also textured-from-the-atlas instead
+     of empty. If a panel wants its own opaque bg, override background. */
+}
+
+/* Game-style tooltips */
+.oasis-tooltip {
+  position: relative;
+}
+
+.oasis-tooltip::before,
+.oasis-tooltip::after {
+  pointer-events: none;
+  position: absolute;
+  left: 50%;
+  opacity: 0;
+  transition:
+    opacity 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+.oasis-tooltip::before {
+  content: attr(data-oasis-tooltip);
+  top: calc(100% + 12px);
+  transform: translate(-50%, -6px);
+  min-width: 108px;
+  max-width: 220px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(103, 232, 249, 0.35);
+  background:
+    linear-gradient(180deg, rgba(10, 14, 22, 0.98) 0%, rgba(5, 8, 14, 0.96) 100%);
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.5),
+    0 0 20px rgba(34, 211, 238, 0.16);
+  color: #d9f7ff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  line-height: 1.35;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+  z-index: 400;
+  backdrop-filter: blur(10px);
+}
+
+.oasis-tooltip::after {
+  content: '';
+  top: calc(100% + 7px);
+  width: 10px;
+  height: 10px;
+  transform: translateX(-50%) rotate(45deg) translateY(-6px);
+  border-left: 1px solid rgba(103, 232, 249, 0.35);
+  border-top: 1px solid rgba(103, 232, 249, 0.35);
+  background: rgba(6, 10, 16, 0.98);
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.14);
+  z-index: 399;
+}
+
+.oasis-tooltip:hover::before,
+.oasis-tooltip:hover::after,
+.oasis-tooltip:focus-visible::before,
+.oasis-tooltip:focus-visible::after,
+.oasis-tooltip:focus-within::before,
+.oasis-tooltip:focus-within::after {
+  opacity: 1;
+}
+
+.oasis-tooltip:hover::before,
+.oasis-tooltip:focus-visible::before,
+.oasis-tooltip:focus-within::before {
+  transform: translate(-50%, 0);
+}
+
+.oasis-tooltip:hover::after,
+.oasis-tooltip:focus-visible::after,
+.oasis-tooltip:focus-within::after {
+  transform: translateX(-50%) rotate(45deg);
+}
+
+/* Glow effect for text */
+.text-glow {
+  text-shadow: 0 0 10px var(--glow), 0 0 20px var(--glow);
+}
+
+/* ░▒▓ Custom scrollbars — sleek dark theme matching UI panels ▓▒░ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(20, 20, 20, 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) rgba(20, 20, 20, 0.3);
+}
+
+/* ॐ 04515 ॐ */

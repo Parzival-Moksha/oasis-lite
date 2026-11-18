@@ -1,0 +1,183 @@
+import { getCameraSnapshot } from './camera-bridge'
+
+export interface PlayerAvatarPose {
+  position: [number, number, number]
+  yaw: number
+  forward: [number, number, number]
+}
+
+export interface CastSpawn {
+  position: [number, number, number]
+  rotation: [number, number, number]
+}
+
+export const PLAYER_AVATAR_LIPSYNC_ID = 'player-avatar'
+
+const DEFAULT_CAST_DISTANCE = 3
+const DEFAULT_GROUND_Y = 0
+
+let latestPlayerAvatarPose: PlayerAvatarPose | null = null
+let playerSpellCasting = false
+let playerManaRecharging = false
+let playerAnimationState = 'idle'
+const spellListeners = new Set<() => void>()
+const manaRechargeListeners = new Set<() => void>()
+const teleportListeners = new Set<(pose: PlayerAvatarPose) => void>()
+
+function cloneVec3(value: [number, number, number]): [number, number, number] {
+  return [value[0], value[1], value[2]]
+}
+
+function notifySpellListeners() {
+  for (const listener of spellListeners) {
+    listener()
+  }
+}
+
+export function setPlayerAvatarPose(pose: PlayerAvatarPose | null): void {
+  latestPlayerAvatarPose = pose
+    ? {
+        position: cloneVec3(pose.position),
+        yaw: pose.yaw,
+        forward: cloneVec3(pose.forward),
+      }
+    : null
+}
+
+export function getPlayerAvatarPose(): PlayerAvatarPose | null {
+  if (!latestPlayerAvatarPose) return null
+  return {
+    position: cloneVec3(latestPlayerAvatarPose.position),
+    yaw: latestPlayerAvatarPose.yaw,
+    forward: cloneVec3(latestPlayerAvatarPose.forward),
+  }
+}
+
+export function getPlayerSpellCasting(): boolean {
+  return playerSpellCasting
+}
+
+export function setPlayerSpellCasting(active: boolean): void {
+  if (playerSpellCasting === active) return
+  playerSpellCasting = active
+  notifySpellListeners()
+}
+
+export function subscribePlayerSpellCasting(listener: () => void): () => void {
+  spellListeners.add(listener)
+  return () => {
+    spellListeners.delete(listener)
+  }
+}
+
+function notifyManaRechargeListeners() {
+  for (const listener of manaRechargeListeners) {
+    listener()
+  }
+}
+
+export function getPlayerManaRecharging(): boolean {
+  return playerManaRecharging
+}
+
+export function setPlayerManaRecharging(active: boolean): void {
+  if (playerManaRecharging === active) return
+  playerManaRecharging = active
+  notifyManaRechargeListeners()
+}
+
+export function getPlayerAnimationState(): string {
+  return playerAnimationState
+}
+
+export function setPlayerAnimationState(state: string): void {
+  playerAnimationState = state || 'idle'
+}
+
+export function subscribePlayerManaRecharging(listener: () => void): () => void {
+  manaRechargeListeners.add(listener)
+  return () => {
+    manaRechargeListeners.delete(listener)
+  }
+}
+
+let thirdPersonCameraRestored = false
+
+/**
+ * Someone (the village camera rig) moved the camera away from third-person and then put it back
+ * exactly where third-person left it. PlayerAvatar should keep its stored azimuth / elevation on
+ * return instead of re-deriving them from the camera offset (shoulder bias of ~8° per visit).
+ */
+export function markThirdPersonCameraRestored(): void {
+  thirdPersonCameraRestored = true
+}
+
+/** One-shot read of markThirdPersonCameraRestored(), used by PlayerAvatar on third-person entry. */
+export function consumeThirdPersonCameraRestored(): boolean {
+  const restored = thirdPersonCameraRestored
+  thirdPersonCameraRestored = false
+  return restored
+}
+
+export function requestPlayerAvatarTeleport(pose: PlayerAvatarPose): void {
+  const next: PlayerAvatarPose = {
+    position: cloneVec3(pose.position),
+    yaw: pose.yaw,
+    forward: cloneVec3(pose.forward),
+  }
+  latestPlayerAvatarPose = next
+  for (const listener of teleportListeners) {
+    listener(next)
+  }
+}
+
+export function subscribePlayerAvatarTeleport(listener: (pose: PlayerAvatarPose) => void): () => void {
+  teleportListeners.add(listener)
+  return () => {
+    teleportListeners.delete(listener)
+  }
+}
+
+export function derivePlayerCastSpawn(distance = DEFAULT_CAST_DISTANCE): CastSpawn {
+  const pose = getPlayerAvatarPose()
+  if (pose) {
+    const [px, py, pz] = pose.position
+    let [fx, , fz] = pose.forward
+    const forwardLength = Math.hypot(fx, fz)
+    if (forwardLength > 0.0001) {
+      fx /= forwardLength
+      fz /= forwardLength
+    } else {
+      fx = Math.sin(pose.yaw)
+      fz = Math.cos(pose.yaw)
+    }
+    return {
+      position: [px + fx * distance, py, pz + fz * distance],
+      rotation: [0, pose.yaw, 0],
+    }
+  }
+
+  const camera = getCameraSnapshot()
+  if (camera) {
+    const [cx, , cz] = camera.position
+    let [fx, , fz] = camera.forward
+    const forwardLength = Math.hypot(fx, fz)
+    if (forwardLength > 0.0001) {
+      fx /= forwardLength
+      fz /= forwardLength
+    } else {
+      fx = 0
+      fz = 1
+    }
+    const yaw = Math.atan2(fx, fz || 1)
+    return {
+      position: [cx + fx * distance, DEFAULT_GROUND_Y, cz + fz * distance],
+      rotation: [0, yaw, 0],
+    }
+  }
+
+  return {
+    position: [0, DEFAULT_GROUND_Y, distance],
+    rotation: [0, 0, 0],
+  }
+}

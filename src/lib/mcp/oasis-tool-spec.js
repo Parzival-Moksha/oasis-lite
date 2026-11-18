@@ -1,0 +1,932 @@
+import { z } from 'zod'
+
+const zVec3Like = z.union([
+  z.string(),
+  z.array(z.number()).min(3).max(3),
+])
+
+const zLooseObject = z.object({}).passthrough()
+const zLooseArrayOrString = z.union([z.array(zLooseObject), z.string()])
+const zNumberish = z.union([z.number(), z.string()])
+const zLoopMode = z.union([z.enum(['repeat', 'once', 'pingpong']), z.boolean()])
+const zSpatialWebValue = z.union([z.string(), z.number(), z.boolean(), z.array(z.string()), z.null()])
+const AGENT_SKY_BACKGROUND_IDS = [
+  'stars',
+  'oasis_dusk',
+  'aurora_night',
+  'pastel_dawn',
+  'cyber_dusk',
+  'clear_day',
+  'aurora_night_sky',
+  'clear_day_sky',
+  'night001',
+  'night004',
+  'night007',
+  'night008',
+  'alps_field',
+  'autumn_ground',
+  'belfast_sunset',
+  'blue_grotto',
+  'evening_road',
+  'outdoor_umbrellas',
+  'stadium',
+  'sunny_vondelpark',
+  'umhlanga_sunrise',
+]
+const SKY_TOOL_ALIASES = {
+  morning: 'umhlanga_sunrise',
+  sunrise: 'umhlanga_sunrise',
+  dawn: 'umhlanga_sunrise',
+  sunset: 'belfast_sunset',
+  dusk: 'belfast_sunset',
+  golden_hour: 'belfast_sunset',
+  evening: 'evening_road',
+  forest: 'sunny_vondelpark',
+  green: 'sunny_vondelpark',
+  nature: 'sunny_vondelpark',
+  park: 'sunny_vondelpark',
+  city: 'stadium',
+  urban: 'stadium',
+  arena: 'stadium',
+  studio: 'outdoor_umbrellas',
+  warehouse: 'stadium',
+  apartment: 'outdoor_umbrellas',
+  lobby: 'outdoor_umbrellas',
+  night: 'night007',
+  night_preset: 'night007',
+  stars: 'stars',
+  starfield: 'stars',
+  desert: 'oasis_dusk',
+  desert_sunset: 'oasis_dusk',
+  dunes: 'oasis_dusk',
+  oasis: 'oasis_dusk',
+  aurora: 'aurora_night',
+  northern_lights: 'aurora_night',
+  aurora_borealis: 'aurora_night',
+  pastel: 'pastel_dawn',
+  pink_dawn: 'pastel_dawn',
+  synthwave: 'cyber_dusk',
+  retrowave: 'cyber_dusk',
+  vaporwave: 'cyber_dusk',
+  cyberpunk: 'cyber_dusk',
+  neon: 'cyber_dusk',
+  day: 'clear_day',
+  daytime: 'clear_day',
+  noon: 'clear_day',
+  clear: 'clear_day',
+  sunny: 'clear_day',
+  blue_sky: 'clear_day',
+  clouds: 'clear_day',
+}
+const SKY_TOOL_PRESET_IDS = [
+  ...AGENT_SKY_BACKGROUND_IDS,
+  ...Object.keys(SKY_TOOL_ALIASES).filter(key => !AGENT_SKY_BACKGROUND_IDS.includes(key)),
+]
+
+function validString(value, fallback = '') {
+  return typeof value === 'string' ? value.trim() || fallback : fallback
+}
+
+function normalizeSkyToken(value) {
+  return validString(value)
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+}
+
+function resolveSkyToolPreset(value) {
+  const normalized = normalizeSkyToken(value)
+  if (!normalized) return ''
+  if (AGENT_SKY_BACKGROUND_IDS.includes(normalized)) return normalized
+  return SKY_TOOL_ALIASES[normalized] || ''
+}
+
+function normalizeLoopMode(value) {
+  if (value === true) return 'repeat'
+  if (value === false) return 'once'
+  const loop = validString(value, 'repeat').toLowerCase()
+  return loop === 'once' || loop === 'pingpong' ? loop : 'repeat'
+}
+
+export const OASIS_MCP_INSTRUCTIONS = [
+  'Oasis is a world-aware MCP server for building, editing, viewing, and navigating Oasis worlds.',
+  'Use get_world_state first when you need rich context.',
+  'Use screenshot_viewport and avatar screenshot tools for visual grounding when a live Oasis browser is connected.',
+  'Avatar and world mutations may execute as embodied sequences rather than instantaneous teleports, so allow time for completion.',
+  'Use text_to_pic, text_to_video, text_to_music, generate_voice, conjure_framed_picture, text_to_pic_building, and place_media when media or placed media would help the conversation.',
+  'For Hermes, Merlin, and OpenClaw, self-crafted objects are the default. Call get_craft_guide for the schema and use self_craft_scene with explicit primitive objects in hosted 04515 mode. Use create_spatial_web_object for 3D form controls and website primitives. Use place_browser_window for live 3D browser surfaces with a predefined URL. Use craft_scene strategy:"sculptor" only in trusted local/full-tool contexts when you intentionally want fallback prompt crafting.',
+].join(' ')
+
+export const OASIS_MCP_TOOL_SPECS = [
+  {
+    name: 'get_world_state',
+    description: 'Get the full active world state, including world name, access rights, catalog objects, crafted scenes, lights, agent avatars, live player avatar/camera context, behaviors, and placed conjured assets.',
+    inputSchema: z.object({ worldId: z.string().optional() }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'get_world_info',
+    description: 'Get a fast summary of the active world: name, write rights, object count, sky, ground, tiles, and lights.',
+    inputSchema: z.object({ worldId: z.string().optional() }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'query_objects',
+    description: 'Search objects already in the world by keyword, type, or proximity.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      query: z.string().optional(),
+      near: zVec3Like.optional(),
+      radius: z.number().optional(),
+      type: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'search_assets',
+    description: 'Search the Oasis asset catalog by keyword. Use this before place_object when you need the exact asset ID.',
+    inputSchema: z.object({
+      query: z.string(),
+      category: z.string().optional(),
+      limit: z.number().optional(),
+    }).passthrough(),
+  },
+  {
+    name: 'get_asset_catalog',
+    description: 'Get the full asset catalog grouped by category.',
+    inputSchema: z.object({}).passthrough(),
+  },
+  {
+    name: 'list_worlds',
+    description: 'List all saved Oasis worlds.',
+    inputSchema: z.object({}).passthrough(),
+  },
+  {
+    name: 'load_world',
+    description: 'Load a specific world by ID. In stateless transports, pass worldId on subsequent tool calls too.',
+    inputSchema: z.object({ worldId: z.string() }).passthrough(),
+  },
+  {
+    name: 'create_world',
+    description: 'Create a new empty world and ask the live Oasis browser to switch/load into it.',
+    inputSchema: z.object({ name: z.string(), icon: z.string().optional() }).passthrough(),
+  },
+  {
+    name: 'create_and_load_world',
+    description: 'Alias of create_world with the behavior made explicit: create a new empty world and switch/load the live Oasis browser into it.',
+    inputSchema: z.object({ name: z.string(), icon: z.string().optional() }).passthrough(),
+  },
+  {
+    name: 'clear_world',
+    description: 'Remove all catalog objects, crafted scenes, spatial web primitives, conjured placements, lights, tiles, behaviors, and avatars from a world.',
+    inputSchema: z.object({ worldId: z.string().optional(), confirm: z.boolean() }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'place_object',
+    description: 'Place a catalog asset into the world at a position, rotation, and scale.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      catalogId: z.string().optional(),
+      assetId: z.string().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      label: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'place_agent_window',
+    description: 'Place a 3D agent window in the world. Use agentType:"browser" plus url/surfaceUrl to place a live 3D browser window. Browser windows default to a baroque frame with thickness 7.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      agentType: z.string().optional(),
+      agent: z.string().optional(),
+      windowId: z.string().optional(),
+      id: z.string().optional(),
+      url: z.string().optional(),
+      surfaceUrl: z.string().optional(),
+      href: z.string().optional(),
+      label: z.string().optional(),
+      name: z.string().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      renderMode: z.enum(['hybrid-snapdom', 'hybrid-foreign-object', 'live-html']).optional(),
+      browserSurfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      surfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      frameStyle: z.string().optional(),
+      frame: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      sessionId: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'place_browser_window',
+    description: 'Place a live 3D web browser surface in the world with a predefined URL. Defaults: live-browser mode, baroque frame, frameThickness 7, 1280x820.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      url: z.string().optional(),
+      surfaceUrl: z.string().optional(),
+      href: z.string().optional(),
+      label: z.string().optional(),
+      name: z.string().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      browserSurfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      surfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      frameStyle: z.string().optional(),
+      frame: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      windowId: z.string().optional(),
+      id: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'create_spatial_web_object',
+    description: 'Create a 3D website primitive in the world: button, toggle, slider, select, multiselect, text panel, or output panel. Use this for voice-built forms, menus, order kiosks, RSVP flows, and "website but not a website" interfaces.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      type: z.enum(['button', 'toggle', 'slider', 'select', 'multiselect', 'text', 'output']),
+      label: z.string(),
+      formId: z.string().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: z.union([z.number(), z.string(), zVec3Like]).optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      accentColor: z.string().optional(),
+      visualStyle: z.enum(['neon-panel', 'arcade-button', 'glass-slider', 'terminal-panel', 'portal-zero-button', 'google-form-altar', 'spellbook-pickup']).optional(),
+      value: zSpatialWebValue.optional(),
+      placeholder: z.string().optional(),
+      description: z.string().optional(),
+      min: zNumberish.optional(),
+      max: zNumberish.optional(),
+      step: zNumberish.optional(),
+      options: z.union([z.array(z.union([zLooseObject, z.string()])), z.string()]).optional(),
+      submitForm: z.boolean().optional(),
+      actionType: z.string().optional(),
+      targetObjectId: z.string().optional(),
+      actionValue: zSpatialWebValue.optional(),
+      endpoint: z.string().optional(),
+      successMessage: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'modify_object',
+    description: 'Modify an existing object in the world: transform, visibility, label, behavior, or metadata.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      objectId: z.string(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: z.union([z.number(), z.string(), zVec3Like]).optional(),
+      label: z.string().optional(),
+      visible: z.boolean().optional(),
+      url: z.string().optional(),
+      surfaceUrl: z.string().optional(),
+      href: z.string().optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      browserSurfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      surfaceMode: z.enum(['live-browser', 'desktop-capture']).optional(),
+      frameStyle: z.string().optional(),
+      frame: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      renderMode: z.enum(['hybrid-snapdom', 'hybrid-foreign-object', 'live-html']).optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'remove_object',
+    description: 'Remove a world object by ID.',
+    inputSchema: z.object({ worldId: z.string().optional(), objectId: z.string() }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'craft_scene',
+    description: 'Create procedural geometry scenes in the full/local Oasis tool surface. For Hermes, Merlin, and OpenClaw, self-crafted objects are the default. Provide an objects array for direct self-crafting. Use prompt text only when you deliberately set strategy="sculptor". Prompt-mode crafting defaults to google/gemini-3.1-flash-lite and may continue asynchronously while primitives appear over time. Hosted 04515 public bridges should use self_craft_scene instead.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      name: z.string().optional(),
+      prompt: z.string().optional(),
+      position: zVec3Like.optional(),
+      objects: z.union([z.array(zLooseObject), z.string()]).optional(),
+      model: z.string().optional(),
+      waitForCompletion: z.boolean().optional(),
+      strategy: z.enum(['agent', 'sculptor']).optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'self_craft_scene',
+    description: 'Public-safe self-crafting tool for hosted 04515: create procedural geometry from an explicit objects array only. No prompt, model, or sculptor fallback is accepted. Call get_craft_guide first, then build the primitive array yourself.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      name: z.string().optional(),
+      position: zVec3Like.optional(),
+      objects: z.union([z.array(zLooseObject), z.string()]),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'get_craft_guide',
+    description: 'Get the exact self-crafting schema for self_craft_scene/craft_scene objects: supported primitive types, animation types, texture presets, required fields, rules, and an example scene.',
+    inputSchema: z.object({}).passthrough(),
+  },
+  {
+    name: 'get_craft_job',
+    description: 'Check the status of an asynchronous craft_scene job and inspect streamed progress, object counts, and final scene IDs.',
+    inputSchema: z.object({ jobId: z.string() }).passthrough(),
+  },
+  {
+    name: 'set_sky',
+    description: [
+      'Change the world sky background (also drives HDRI lighting).',
+      `Stable presetId values: ${AGENT_SKY_BACKGROUND_IDS.join(', ')}.`,
+      'Generated Oasis skies: oasis_dusk = desert sunset over dunes; aurora_night = northern lights over a pine treeline; pastel_dawn = pink and lavender dawn with misty hills; cyber_dusk = synthwave moon, neon mountains and grid; clear_day = bright blue sky with cumulus; aurora_night_sky / clear_day_sky = the same with open sky instead of land below the horizon (floating islands, no ground plane).',
+      'Accepted aliases: dawn/sunrise -> umhlanga_sunrise; sunset/dusk -> belfast_sunset; forest/park -> sunny_vondelpark; city/arena -> stadium; night -> night007; desert -> oasis_dusk; aurora -> aurora_night; synthwave/neon -> cyber_dusk; day/sunny -> clear_day.',
+      'Use stable local HDRI ids when possible; CDN-only drei presets are intentionally not exposed to agents because failures render as procedural stars.',
+    ].join(' '),
+    inputSchema: z.object({ worldId: z.string().optional(), presetId: z.enum(SKY_TOOL_PRESET_IDS) }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'list_ground_presets',
+    description: 'List available ground textures with short labels and descriptions. Use this BEFORE set_ground_preset or paint_ground_tiles to discover valid presetId values. Pass query to filter (e.g. "wood", "brick", "rough"). Returns: [{id, label, description, icon, tileRepeat}].',
+    inputSchema: z.object({
+      query: z.string().optional(),
+      limit: zNumberish.optional(),
+    }).passthrough(),
+  },
+  {
+    name: 'set_ground_preset',
+    description: [
+      'Change the world ground texture.',
+      'Use list_ground_presets first to find valid presetId values; the catalog is too large to list inline.',
+      'Common ids: none, grass, dirt, sand, stone, snow, cobble, forest, concrete, marble, metal, beach.',
+      'Use the exact id, not the display name.',
+    ].join(' '),
+    inputSchema: z.object({ worldId: z.string().optional(), presetId: z.string() }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'paint_ground_tiles',
+    description: 'Paint individual 1x1m ground tiles using a presetId. Use list_ground_presets to find valid ids. tiles may be an array or JSON string.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      presetId: z.string().optional(),
+      tiles: z.union([z.array(zLooseObject), z.string()]),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'add_light',
+    description: 'Add a world light source.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      type: z.string(),
+      position: zVec3Like.optional(),
+      color: z.string().optional(),
+      intensity: zNumberish.optional(),
+      label: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'modify_light',
+    description: 'Modify an existing world light.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      lightId: z.string(),
+      position: zVec3Like.optional(),
+      color: z.string().optional(),
+      intensity: zNumberish.optional(),
+      visible: z.boolean().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'set_behavior',
+    description: 'Set object movement or animation behavior such as static, spin, hover, orbit, bounce, or patrol.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      objectId: z.string(),
+      movement: z.string().optional(),
+      speed: zNumberish.optional(),
+      radius: zNumberish.optional(),
+      amplitude: zNumberish.optional(),
+      height: zNumberish.optional(),
+      label: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'set_avatar',
+    description: 'Create or update an embodied agent avatar in the world.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      agentType: z.string().optional(),
+      agent: z.string().optional(),
+      avatarId: z.string().optional(),
+      linkedWindowId: z.string().optional(),
+      avatarUrl: z.string().optional(),
+      avatar3dUrl: z.string().optional(),
+      url: z.string().optional(),
+      label: z.string().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'walk_avatar_to',
+    description: 'Send an embodied agent avatar walking to a target position. The visual move can take time before later world mutations should happen.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      agentType: z.string().optional(),
+      agent: z.string().optional(),
+      avatarId: z.string().optional(),
+      position: zVec3Like.optional(),
+      target: zVec3Like.optional(),
+      speed: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'list_avatar_animations',
+    description: 'List the exact avatar animation IDs supported by Oasis. Call this before play_avatar_animation instead of guessing clip names.',
+    inputSchema: z.object({
+      category: z.string().optional(),
+      query: z.string().optional(),
+      limit: z.number().optional(),
+    }).passthrough(),
+  },
+  {
+    name: 'play_avatar_animation',
+    description: 'Play a library animation on an embodied agent avatar. Call list_avatar_animations first and pass an exact clipName. Animations play once by default unless you set loop:"repeat" or loop:"pingpong".',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      agentType: z.string().optional(),
+      agent: z.string().optional(),
+      avatarId: z.string().optional(),
+      clipName: z.string().optional(),
+      animationId: z.string().optional(),
+      animation: z.string().optional(),
+      name: z.string().optional(),
+      loop: zLoopMode.optional(),
+      speed: zNumberish.optional(),
+      durationMs: z.number().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'screenshot_viewport',
+    description: [
+      'Capture screenshots of the 3D world. Six modes, each with its own subject + arg recipe:',
+      '• mode:"current" — what the human user literally sees on screen (their camera). No args needed.',
+      '• mode:"agent-avatar-phantom" — first-person from an agent\'s eye, looking along their forward vector. Args: agentType (default=caller), heightOffset (1.55), distance (1), lookAhead (5), fov (100). Treat this as "agent FPS".',
+      '• mode:"look-at" — free camera. Args: position (camera pos), target (focal point), fov (75). Use when you want an explicit arbitrary camera placement.',
+      '• mode:"external-orbit" — distant overview orbiting a subject. Args: target OR agentType (defaults to caller), distance (16), heightOffset (9), fov (60). Good for scene-wide context. Alias: mode:"external".',
+      '• mode:"third-person-follow" — over-shoulder behind a subject. Args: agentType (default=caller; pass "player" to follow the user), distance (4.4), heightOffset (2.1), lookAhead (4), fov (72).',
+      '• mode:"avatar-portrait" — close headshot of a subject. Args: agentType (default=caller; "player"/"me"/"self" → the user), distance (2.75), heightOffset (1.55), fov (45).',
+      'lookAhead = meters ahead of the subject the camera focal point sits (camera POINTS THERE).',
+      'Pass views:[{mode,...}, {mode,...}] as an array for multi-angle capture in one call.',
+      'IMPORTANT: "player"/"user"/"me"/"self" all mean the human carbondev, NOT the calling agent.',
+    ].join('\n'),
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      format: z.string().optional(),
+      quality: zNumberish.optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      settleMs: z.number().optional(),
+      views: zLooseArrayOrString.optional(),
+      mode: z.string().describe('current | agent-avatar-phantom | look-at | external-orbit | third-person-follow | avatar-portrait').optional(),
+      agentType: z.string().optional(),
+      agent: z.string().optional(),
+      position: zVec3Like.optional(),
+      target: zVec3Like.optional(),
+      cameraPosition: zVec3Like.optional(),
+      cameraTarget: zVec3Like.optional(),
+      distance: zNumberish.optional(),
+      heightOffset: zNumberish.optional(),
+      lookAhead: zNumberish.optional(),
+      fov: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectDefaultAgentType: true,
+    injectRequesterAgentType: true,
+  },
+  {
+    name: 'screenshot_avatar',
+    description: 'Capture an avatar-focused screenshot for a subject. Valid subjects: "player" (the human user; aliases "user"/"me"/"self"), "merlin", "hermes", "openclaw", "anorak", or any agentType present in the world. Use style:"portrait" for a headshot, style:"third-person" for behind-the-body context. This is for avatar shots specifically — NOT the user camera viewport (that\'s screenshot_viewport mode:"current"). If subject is omitted, falls back to the calling agent.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      subject: z.string().optional(),
+      style: z.string().optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      distance: zNumberish.optional(),
+      heightOffset: zNumberish.optional(),
+      fov: zNumberish.optional(),
+      settleMs: z.number().optional(),
+      format: z.string().optional(),
+      quality: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectDefaultAgentType: true,
+    injectRequesterAgentType: true,
+  },
+  {
+    name: 'avatarpic_merlin',
+    description: 'Capture Merlin avatar imagery, optionally in third-person mode.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      style: z.string().optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      distance: zNumberish.optional(),
+      heightOffset: zNumberish.optional(),
+      fov: zNumberish.optional(),
+      settleMs: z.number().optional(),
+      format: z.string().optional(),
+      quality: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'avatarpic_user',
+    description: 'Capture avatar imagery of the human user (aka player/carbondev/me/self — the person you are talking to, NOT a calling agent). Use style:"portrait" for a headshot, style:"third-person" for full-body context.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      style: z.string().optional(),
+      width: zNumberish.optional(),
+      height: zNumberish.optional(),
+      distance: zNumberish.optional(),
+      heightOffset: zNumberish.optional(),
+      fov: zNumberish.optional(),
+      settleMs: z.number().optional(),
+      format: z.string().optional(),
+      quality: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'generate_image',
+    description: 'Generate an image from a text prompt. Returns a media URL that Oasis can display in the OpenClaw stream.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      model: z.string().optional(),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'text_to_pic',
+    description: 'Generate an image from a prompt and place it in the world as a framed picture. Friendly spell alias for conjure_framed_picture.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      prompt: z.string(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      frameStyle: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      model: z.string().optional(),
+      name: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'generate_voice',
+    description: 'Generate a voice note from text. Returns an audio URL that Oasis can play and lip-sync through the OpenClaw avatar.',
+    inputSchema: z.object({
+      text: z.string().optional(),
+      prompt: z.string().optional(),
+      voice: z.string().optional(),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'generate_video',
+    description: 'Generate a short video clip from a text prompt. Returns a media URL that Oasis can display in the OpenClaw stream.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      duration: zNumberish.optional(),
+      image_url: z.string().optional(),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'text_to_video',
+    description: 'Generate a short video clip from a text prompt. Friendly spell alias for generate_video.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      duration: zNumberish.optional(),
+      image_url: z.string().optional(),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'text_to_music',
+    description: 'Generate a music clip or song from a text prompt via ElevenLabs Music. Returns an MP3 URL Oasis can preview and play. Use place_media kind:"audio" to drop the result into the world as a loudspeaker.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      durationMs: zNumberish.optional().describe('Length in milliseconds, 3000–600000. Default 30000.'),
+      instrumental: z.boolean().optional().describe('If true, no vocals. Default false.'),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'conjure_framed_picture',
+    description: [
+      'Generate an image from a prompt and place it in the world as a framed picture in one shot.',
+      'Frame styles: gilded | neon | thin | baroque | hologram | rustic | ice | void | spaghetti | fire | matrix | plasma | brutalist | building (default: baroque).',
+      'frameThickness: 0.5-8 multiplier (default 1).',
+      'scale: picture height in meters (default 2). Width auto-fits image aspect.',
+      'rotation: euler radians [x, y, z] (default [0, 0, 0]). Set y to face the picture toward viewers.',
+    ].join(' '),
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      prompt: z.string(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      frameStyle: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      model: z.string().optional(),
+      name: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'text_to_pic_building',
+    description: 'Generate a square-ish image from a prompt and place it as a four-sided textured building facade in the 3D world. Use for text-to-3D picture buildings, storefronts, towers, kiosks, and facade props.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      prompt: z.string(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      frameThickness: zNumberish.optional(),
+      model: z.string().optional(),
+      name: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'place_media',
+    description: [
+      'Place an existing media URL (image, video, or audio) into the world.',
+      'kind: "image" → framed picture; "video" → framed video screen; "audio" → loudspeaker box.',
+      'If kind is omitted, it is auto-detected from the URL extension.',
+      'frameStyle (image/video only): gilded | neon | thin | baroque | hologram | rustic | ice | void | spaghetti | fire | matrix | plasma | brutalist | building.',
+      'frameThickness: 0.5-8 (default 1).',
+      'For audio, use audioVolume (0–1, default 1) and audioMaxDistance (meters, default 15).',
+      'Use this when the asset already lives at a URL. To generate from a prompt instead, use text_to_pic, text_to_pic_building, text_to_video, or text_to_music.',
+    ].join(' '),
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      url: z.string(),
+      kind: z.string().optional().describe('image | video | audio (auto-detected from URL if omitted)'),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+      frameStyle: z.string().optional(),
+      frameThickness: zNumberish.optional(),
+      audioVolume: zNumberish.optional(),
+      audioMaxDistance: zNumberish.optional(),
+      audioLoop: z.boolean().optional().describe('Audio only. Loop forever (default true).'),
+      audioMuted: z.boolean().optional().describe('Audio only. Start muted (default false).'),
+      audioState: z.string().optional().describe('Audio only. "playing" (default), "paused", or "stopped".'),
+      name: z.string().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'upload_to_library',
+    description: [
+      'Save an external media asset (image / video / audio) into the local Oasis media library so it can be referenced by URL later (e.g. via place_media).',
+      'Provide either url (the asset will be fetched server-side) or data (base64-encoded bytes).',
+      'kind: image | video | audio. Required.',
+      'Returns the new library URL under /images/.',
+    ].join(' '),
+    inputSchema: z.object({
+      url: z.string().optional(),
+      data: z.string().optional().describe('Base64-encoded media bytes (alternative to url).'),
+      kind: z.string(),
+      name: z.string().optional(),
+    }).passthrough(),
+    injectActorAgentType: true,
+  },
+  {
+    name: 'list_conjured_assets',
+    description: 'List Forge/Meshy/Tripo conjured assets known to Oasis, optionally filtered by status, provider, characterMode, or placement in the active world.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      status: z.string().optional(),
+      provider: z.string().optional(),
+      characterMode: z.boolean().optional(),
+      inWorldOnly: z.boolean().optional(),
+      activeWorldOnly: z.boolean().optional(),
+      limit: z.number().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'get_conjured_asset',
+    description: 'Get the full registry record for one conjured asset.',
+    inputSchema: z.object({ worldId: z.string().optional(), assetId: z.string() }).passthrough(),
+    injectWorldId: true,
+  },
+  {
+    name: 'conjure_asset',
+    description: 'Start a new Meshy or Tripo conjuration, optionally place it into the active world immediately, and track it as it generates.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      prompt: z.string(),
+      provider: z.string().optional(),
+      tier: z.string().optional(),
+      imageUrl: z.string().optional(),
+      characterMode: z.boolean().optional(),
+      characterOptions: zLooseObject.optional(),
+      autoRig: z.boolean().optional(),
+      autoAnimate: z.boolean().optional(),
+      animationPreset: z.string().optional(),
+      placeInWorld: z.boolean().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'process_conjured_asset',
+    description: 'Post-process an existing conjured asset with texture, remesh, rig, or animate, optionally placing the child asset into the active world.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      assetId: z.string(),
+      action: z.string(),
+      options: zLooseObject.optional(),
+      placeInWorld: z.boolean().optional(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'place_conjured_asset',
+    description: 'Place or reposition an existing conjured asset in the active world.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      assetId: z.string(),
+      position: zVec3Like.optional(),
+      rotation: zVec3Like.optional(),
+      scale: zNumberish.optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+  {
+    name: 'delete_conjured_asset',
+    description: 'Remove a conjured asset from the active world and optionally banish it from the Forge registry too.',
+    inputSchema: z.object({
+      worldId: z.string().optional(),
+      assetId: z.string(),
+      deleteRegistry: z.boolean().optional(),
+    }).passthrough(),
+    injectWorldId: true,
+    injectActorAgentType: true,
+  },
+]
+
+const TOOL_SPEC_MAP = new Map(OASIS_MCP_TOOL_SPECS.map(spec => [spec.name, spec]))
+
+export function getOasisToolSpec(name) {
+  return TOOL_SPEC_MAP.get(name) || null
+}
+
+export function prepareOasisToolArgs(name, args = {}, context = {}) {
+  const spec = getOasisToolSpec(name)
+  const next = args && typeof args === 'object' ? { ...args } : {}
+  const worldId = validString(context.worldId)
+  const agentType = validString(context.agentType).toLowerCase()
+
+  if (spec?.injectWorldId && worldId && !validString(next.worldId)) {
+    next.worldId = worldId
+  }
+  if (spec?.injectActorAgentType && agentType && !validString(next.actorAgentType)) {
+    next.actorAgentType = validString(next.agentType || next.agent, agentType).toLowerCase()
+  }
+  if (spec?.injectDefaultAgentType && agentType && !validString(next.defaultAgentType)) {
+    next.defaultAgentType = validString(next.agentType || next.agent, agentType).toLowerCase()
+  }
+  if (spec?.injectRequesterAgentType && agentType && !validString(next.requesterAgentType)) {
+    next.requesterAgentType = agentType
+  }
+
+  if (name === 'place_object' && !validString(next.catalogId) && validString(next.assetId)) {
+    next.catalogId = next.assetId
+  }
+
+  if (name === 'place_agent_window') {
+    const surfaceUrl = validString(next.surfaceUrl || next.url || next.href)
+    if (surfaceUrl) next.surfaceUrl = surfaceUrl
+    if (!validString(next.agentType) && validString(next.agent)) {
+      next.agentType = validString(next.agent).toLowerCase()
+    }
+  }
+
+  if (name === 'place_browser_window') {
+    const surfaceUrl = validString(next.surfaceUrl || next.url || next.href)
+    if (surfaceUrl) next.surfaceUrl = surfaceUrl
+    next.agentType = 'browser'
+    if (!validString(next.browserSurfaceMode || next.surfaceMode)) next.browserSurfaceMode = 'live-browser'
+    if (!validString(next.frameStyle || next.frame)) next.frameStyle = 'baroque'
+    if (next.frameThickness === undefined) next.frameThickness = 7
+  }
+
+  if (name === 'text_to_pic_building') {
+    next.frameStyle = 'building'
+    if (next.frameThickness === undefined) next.frameThickness = 7
+    if (next.scale === undefined) next.scale = 4
+  }
+
+  if (name === 'set_sky') {
+    const requestedSky = validString(next.presetId || next.skyBackgroundId)
+    const resolvedSky = resolveSkyToolPreset(requestedSky)
+    if (resolvedSky) next.presetId = resolvedSky
+    delete next.skyBackgroundId
+  }
+
+  if (name === 'modify_object') {
+    const surfaceUrl = validString(next.surfaceUrl || next.url || next.href)
+    if (surfaceUrl) next.surfaceUrl = surfaceUrl
+  }
+
+  if (name === 'set_avatar') {
+    const avatarUrl = validString(next.avatarUrl || next.avatar3dUrl || next.url)
+    if (avatarUrl) next.avatarUrl = avatarUrl
+    if (!validString(next.agentType) && validString(next.agent)) {
+      next.agentType = validString(next.agent).toLowerCase()
+    }
+  }
+
+  if (name === 'walk_avatar_to') {
+    if (!validString(next.agentType) && validString(next.agent)) {
+      next.agentType = validString(next.agent).toLowerCase()
+    }
+  }
+
+  if (name === 'play_avatar_animation') {
+    const clipName = validString(next.clipName || next.animationId || next.animation || next.name)
+    if (clipName) next.clipName = clipName
+    if (!validString(next.agentType) && validString(next.agent)) {
+      next.agentType = validString(next.agent).toLowerCase()
+    }
+    if (next.loop !== undefined) {
+      next.loop = normalizeLoopMode(next.loop)
+    }
+  }
+
+  if (name === 'list_conjured_assets' && next.inWorldOnly === undefined && next.activeWorldOnly !== undefined) {
+    next.inWorldOnly = next.activeWorldOnly
+  }
+
+  return next
+}

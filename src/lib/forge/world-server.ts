@@ -1,0 +1,1351 @@
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// WORLD SERVER — The bedrock beneath all worlds
+// ─═̷─═̷─ॐ─═̷─═̷─ SQLite local-first persistence ─═̷─═̷─ॐ─═̷─═̷─
+//
+// v4: Local SQLite via Prisma. One row per world, JSON data column.
+// No Supabase dependency. No internet required. Fully offline.
+//
+// SERVER-ONLY — never import from client code.
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+import { createHash } from 'crypto'
+import { cleanWorldIcon } from '../text-encoding'
+
+import { prisma } from '../db'
+import { normalizeWorldStateAgentAvatarTransforms } from '../agent-avatar-world-state'
+import { getOasisMode } from '../oasis-profile'
+import { isAdminUserId } from '../admin-auth'
+import { levelFromXp } from '../xp'
+import { createPortalZeroReturnGate } from '../portal-zero-return-gate'
+import { mirrorDefaultWorldSeed, type DefaultWorldSeedWriteResult } from '../default-world-seed-writer'
+import { generateWorldShortCode, isWorldShortCodeCollision } from '../world-short-codes'
+import { DEFAULT_WORLD_LIGHTS, type WorldLight } from '../conjure/types'
+import {
+  DISCOVERABLE_VISIBILITIES,
+  FFA_VISIBILITIES,
+  PUBLICLY_READABLE_VISIBILITIES,
+  WorldAccessError,
+  assertCanEditWorldSettings,
+  canDiscoverWorld,
+  canEditWorldSettings,
+  canReadWorld,
+  getWorldWriteDecision,
+  normalizeWorldKind,
+  toStorageVisibility,
+  type WorldAccessContext,
+  type WorldAccessSubject,
+} from './world-access'
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+import type { WorldMeta, WorldState } from './world-persistence'
+import type { WorldEventEnvelope } from '../world-commands/types'
+export type { WorldState, WorldMeta }
+
+interface OwnerProfileSummary {
+  displayName: string
+  avatarUrl: string | null
+  totalXp: number
+  aura: number
+}
+
+export interface SnapshotMeta {
+  id: string
+  world_id: string
+  object_count: number
+  source: 'auto' | 'manual'
+  created_at: string
+}
+
+export interface SaveWorldResult {
+  saved: boolean
+  conflict?: boolean
+  serverUpdatedAt?: string
+  worldId?: string
+  forkedFromWorldId?: string
+  savedAt?: string
+  defaultWorldSeed?: DefaultWorldSeedWriteResult
+}
+
+export interface AppendWorldCommandEventInput {
+  eventId: string
+  worldId: string
+  commandId: string
+  actorId: string
+  sessionId?: string
+  kind: string
+  worldVersion: number
+  payload: unknown
+  createdAt?: string
+}
+
+export type RoomCheckpointEventInput = Partial<WorldEventEnvelope> & {
+  command?: WorldEventEnvelope['command']
+}
+
+const MAX_SNAPSHOTS_PER_WORLD = 20
+const SNAPSHOT_THROTTLE_MS = 5 * 60 * 1000
+const DEFAULT_WORLD_SEED_VISIBILITIES = new Set(['core', 'template', 'public'])
+
+function seedDefaultWorldLights(): WorldLight[] {
+  return DEFAULT_WORLD_LIGHTS.map((light, index) => ({
+    ...light,
+    id: `light-${light.type}-default-${index}`,
+    visible: true,
+  } as WorldLight))
+}
+
+function normalizeSavedWorldState(state: WorldState): WorldState {
+  return normalizeWorldStateAgentAvatarTransforms(state)
+}
+
+function accessContext(userId?: string): WorldAccessContext {
+  const resolvedUserId = userId || 'local-user'
+  return {
+    userId: resolvedUserId,
+    mode: getOasisMode(),
+    admin: isAdminUserId(resolvedUserId),
+  }
+}
+
+function canMirrorDefaultWorldSeeds(ctx: WorldAccessContext): boolean {
+  return ctx.mode === 'local' || Boolean(ctx.system || ctx.admin)
+}
+
+async function mirrorDefaultWorldSeedForSource(
+  ctx: WorldAccessContext,
+  source: Parameters<typeof mirrorDefaultWorldSeed>[0],
+): Promise<DefaultWorldSeedWriteResult | null> {
+  if (!canMirrorDefaultWorldSeeds(ctx)) return null
+  if (!DEFAULT_WORLD_SEED_VISIBILITIES.has(source.visibility)) return null
+  try {
+    const result = await mirrorDefaultWorldSeed(source)
+    if (result.updated) {
+      console.log(`[WorldServer] Mirrored default world seed ${source.id} -> ${result.file || result.slug || 'manifest'}`)
+    }
+    return result
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`[WorldServer] Default world seed mirror failed for ${source.id}:`, message)
+    return { updated: false }
+  }
+}
+
+async function mirrorDefaultWorldSeedById(
+  ctx: WorldAccessContext,
+  worldId: string,
+): Promise<DefaultWorldSeedWriteResult | null> {
+  if (!canMirrorDefaultWorldSeeds(ctx)) return null
+  const world = await prisma.world.findFirst({
+    where: { id: worldId },
+    select: {
+      id: true,
+      shortCode: true,
+      userId: true,
+      name: true,
+      icon: true,
+      visibility: true,
+      pvpEnabled: true,
+      creatorName: true,
+      creatorAvatar: true,
+      thumbnailUrl: true,
+      data: true,
+    },
+  })
+  if (!world) return null
+  return mirrorDefaultWorldSeedForSource(ctx, world)
+}
+
+function toAccessSubject(row: WorldAccessSubject): WorldAccessSubject {
+  return {
+    id: row.id,
+    userId: row.userId,
+    visibility: row.visibility || 'private',
+  }
+}
+
+function countWorldObjects(state: Pick<WorldState, 'conjuredAssetIds' | 'catalogPlacements' | 'craftedScenes' | 'portalGates' | 'spatialWebObjects' | 'agentAvatars' | 'agentWindows'>): number {
+  return (state.conjuredAssetIds?.length || 0) +
+    (state.catalogPlacements?.length || 0) +
+    (state.craftedScenes?.length || 0) +
+    (state.portalGates?.length || 0) +
+    (state.spatialWebObjects?.length || 0) +
+    (state.agentAvatars?.length || 0) +
+    (state.agentWindows?.length || 0)
+}
+
+function countNonPortalWorldContent(state: Pick<WorldState, 'conjuredAssetIds' | 'catalogPlacements' | 'craftedScenes' | 'spatialWebObjects' | 'agentAvatars' | 'agentWindows'>): number {
+  return (state.conjuredAssetIds?.length || 0) +
+    (state.catalogPlacements?.length || 0) +
+    (state.craftedScenes?.length || 0) +
+    (state.spatialWebObjects?.length || 0) +
+    (state.agentAvatars?.length || 0) +
+    (state.agentWindows?.length || 0)
+}
+
+function assertNotPortalOnlyOverwrite(worldId: string, currentData: string | null | undefined, nextState: WorldState): void {
+  if (!currentData) return
+  let currentState: WorldState
+  try {
+    currentState = JSON.parse(currentData) as WorldState
+  } catch {
+    return
+  }
+
+  const currentNonPortalContent = countNonPortalWorldContent(currentState)
+  const nextNonPortalContent = countNonPortalWorldContent(nextState)
+  const nextPortalCount = nextState.portalGates?.length || 0
+
+  if (currentNonPortalContent >= 3 && nextNonPortalContent === 0 && nextPortalCount > 0) {
+    throw new WorldAccessError(
+      `Refusing to overwrite ${worldId}: current world has ${currentNonPortalContent} non-portal objects, but the incoming save has 0 and only ${nextPortalCount} portal gates.`,
+      'world_content_drop_blocked',
+      409,
+    )
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function toWorldMeta(
+  row: {
+    id: string
+    shortCode?: string | null
+    userId?: string
+    name: string
+    icon: string
+    visibility: string
+    creatorName?: string | null
+    creatorAvatar?: string | null
+    visitCount?: number | null
+    likeCount?: number | null
+    objectCount?: number | null
+    pvpEnabled?: boolean | null
+    createdAt: Date
+    updatedAt: Date
+  },
+  ctx?: WorldAccessContext,
+  ownerProfile?: OwnerProfileSummary | null,
+  likedByViewer = false,
+): WorldMeta {
+  const subject = row.userId ? toAccessSubject(row as WorldAccessSubject) : null
+  const writeDecision = ctx && subject ? getWorldWriteDecision(ctx, subject) : undefined
+  const ownerName = row.creatorName || ownerProfile?.displayName || (row.userId === 'system' ? 'Oasis' : 'Player 1')
+  const ownerAvatar = row.creatorAvatar || ownerProfile?.avatarUrl || undefined
+  const ownerLevel = ownerProfile ? levelFromXp(ownerProfile.totalXp || 0) : undefined
+  const ownerAura = ownerProfile?.aura
+  return {
+    id: row.id,
+    shortCode: row.shortCode || null,
+    userId: row.userId,
+    name: row.name,
+    icon: row.icon || '🌍',
+    visibility: (row.visibility as WorldMeta['visibility']) || 'private',
+    canWrite: writeDecision ? writeDecision !== 'deny' : undefined,
+    canEditSettings: ctx && subject ? canEditWorldSettings(ctx, subject) : undefined,
+    writeDecision,
+    creatorName: ownerName,
+    creatorAvatar: ownerAvatar,
+    creator_name: ownerName,
+    creator_avatar: ownerAvatar,
+    ownerName,
+    ownerAvatar,
+    ownerLevel,
+    ownerAura,
+    objectCount: row.objectCount || 0,
+    visitCount: row.visitCount || 0,
+    likeCount: row.likeCount || 0,
+    likedByViewer,
+    pvpEnabled: row.pvpEnabled ?? false,
+    createdAt: row.createdAt.toISOString(),
+    lastSavedAt: row.updatedAt.toISOString(),
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REGISTRY — local lists everything; hosted lists owned + discoverable worlds.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function getOwnerProfiles(userIds: Array<string | undefined>): Promise<Map<string, OwnerProfileSummary>> {
+  const ids = Array.from(new Set(userIds.filter((id): id is string => Boolean(id))))
+  if (ids.length === 0) return new Map()
+  const profiles = await prisma.profile.findMany({
+    where: { userId: { in: ids } },
+    select: { userId: true, displayName: true, avatarUrl: true, totalXp: true, aura: true },
+  })
+  return new Map(profiles.map(profile => [profile.userId, profile] as const))
+}
+
+export async function getRegistry(userId?: string): Promise<WorldMeta[]> {
+  const ctx = accessContext(userId)
+  const worlds = await prisma.world.findMany({
+    select: {
+      id: true,
+      userId: true,
+      name: true,
+      icon: true,
+      visibility: true,
+      creatorName: true,
+      creatorAvatar: true,
+      visitCount: true,
+      likeCount: true,
+      objectCount: true,
+      pvpEnabled: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+    where: ctx.mode === 'hosted' && !ctx.admin
+      ? {
+          OR: [
+            { userId: ctx.userId },
+            { visibility: { in: DISCOVERABLE_VISIBILITIES } },
+          ],
+        }
+      : undefined,
+    orderBy: { createdAt: 'asc' },
+  })
+
+  if (worlds.length === 0) {
+    const defaultWorld = await createWorld('The Forge', '🔥', ctx.userId)
+    return [defaultWorld]
+  }
+
+  const visibleWorlds = worlds.filter(world => canDiscoverWorld(ctx, toAccessSubject(world)))
+  const profiles = await getOwnerProfiles(visibleWorlds.map(world => world.userId))
+  const likedRows = visibleWorlds.length > 0
+    ? await prisma.worldLike.findMany({
+        where: { userId: ctx.userId, worldId: { in: visibleWorlds.map(world => world.id) } },
+        select: { worldId: true },
+      })
+    : []
+  const likedWorldIds = new Set(likedRows.map(row => row.worldId))
+  return visibleWorlds.map(world => toWorldMeta(world, ctx, profiles.get(world.userId), likedWorldIds.has(world.id)))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOAD — Fetch a single world's full state
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function loadWorld(id: string, userId?: string): Promise<WorldState | null> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true, data: true, updatedAt: true },
+  })
+  if (!world) return null
+  if (!canReadWorld(ctx, toAccessSubject(world))) return null
+  if (!world?.data) return null
+  const state = normalizeSavedWorldState(JSON.parse(world.data) as WorldState)
+  return {
+    ...state,
+    savedAt: world.updatedAt?.toISOString() || state.savedAt,
+  }
+}
+
+export async function appendWorldCommandEvent(input: AppendWorldCommandEventInput): Promise<void> {
+  await prisma.worldEvent.create({
+    data: worldCommandEventCreateData(input),
+  })
+}
+
+function worldCommandEventCreateData(input: AppendWorldCommandEventInput) {
+  const payload = JSON.stringify(input.payload)
+  return {
+    id: input.eventId,
+    worldId: input.worldId,
+    commandId: input.commandId,
+    actorId: input.actorId,
+    sessionId: input.sessionId || '',
+    kind: input.kind,
+    worldVersion: Math.max(0, Math.floor(input.worldVersion || 0)),
+    payload,
+    payloadHash: createHash('sha256').update(payload).digest('hex'),
+    createdAt: input.createdAt ? new Date(input.createdAt) : new Date(),
+  }
+}
+
+export async function loadWorldCommandEvent(worldId: string, commandId: string): Promise<WorldEventEnvelope | null> {
+  const row = await prisma.worldEvent.findFirst({
+    where: { worldId, commandId },
+    orderBy: { worldVersion: 'asc' },
+    select: { payload: true },
+  })
+  if (!row?.payload) return null
+  try {
+    const parsed = JSON.parse(row.payload) as Partial<WorldEventEnvelope>
+    if (parsed.kind !== 'command.accepted' && parsed.kind !== 'command.rejected') return null
+    if (parsed.worldId !== worldId || parsed.commandId !== commandId) return null
+    if (typeof parsed.id !== 'string' || typeof parsed.acceptedAt !== 'string') return null
+    return parsed as WorldEventEnvelope
+  } catch {
+    return null
+  }
+}
+
+export async function latestWorldCommandRevision(worldId: string): Promise<number> {
+  const latest = await prisma.worldEvent.findFirst({
+    where: { worldId },
+    orderBy: { worldVersion: 'desc' },
+    select: { worldVersion: true },
+  })
+  return Math.max(0, latest?.worldVersion || 0)
+}
+
+export async function nextWorldCommandRevision(worldId: string): Promise<number> {
+  return Math.max(1, await latestWorldCommandRevision(worldId) + 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAVE — Upsert world state with auto-snapshot
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function forkTemplateWorld(
+  template: { id: string; name: string; icon: string; visibility: string },
+  userId: string,
+  worldData: WorldState,
+  now: Date,
+): Promise<WorldMeta> {
+  const id = `world-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+  let world: Awaited<ReturnType<typeof prisma.world.create>> | null = null
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      world = await prisma.world.create({
+        data: {
+          id,
+          shortCode: await generateWorldShortCode(),
+          userId,
+          name: template.name,
+          icon: template.icon,
+          visibility: 'private',
+          data: JSON.stringify(worldData),
+          objectCount: countWorldObjects(worldData),
+          createdAt: now,
+          updatedAt: now,
+        },
+      })
+      break
+    } catch (error) {
+      if (isWorldShortCodeCollision(error)) continue
+      throw error
+    }
+  }
+  if (!world) throw new Error('Could not create world with a unique short code.')
+
+  console.log(`[WorldServer] Forked template ${template.id} -> ${id} for user ${userId}`)
+  return toWorldMeta(world, accessContext(userId))
+}
+
+export async function saveWorld(
+  id: string,
+  userId: string,
+  state: Omit<WorldState, 'version' | 'savedAt'>,
+  clientLoadedAt?: string
+): Promise<SaveWorldResult> {
+  const ctx = accessContext(userId)
+  const now = new Date()
+  const worldData = normalizeSavedWorldState({ version: 1, ...state, savedAt: now.toISOString() })
+
+  const target = await prisma.world.findFirst({
+    where: { id },
+    select: {
+      id: true,
+      userId: true,
+      name: true,
+      icon: true,
+      visibility: true,
+      pvpEnabled: true,
+      creatorName: true,
+      creatorAvatar: true,
+      thumbnailUrl: true,
+      updatedAt: true,
+      data: true,
+    },
+  })
+  if (!target) {
+    throw new WorldAccessError('World not found', 'world_not_found', 404)
+  }
+
+  const writeDecision = getWorldWriteDecision(ctx, toAccessSubject(target))
+  if (writeDecision === 'deny') {
+    // ─═̷─ Diagnostic context for ClawCon-era FFA-delete bug reports.
+    // Reveal which side of the gate failed (mode, userId vs owner,
+    // visibility) without leaking sensitive payload contents. ─═̷─
+    console.warn('[world-server] write_forbidden', {
+      worldId: id,
+      worldOwnerId: target.userId,
+      visibility: target.visibility,
+      callerUserId: ctx.userId,
+      mode: ctx.mode,
+      system: ctx.system,
+      admin: ctx.admin,
+    })
+    throw new WorldAccessError('This session cannot mutate that world', 'world_write_forbidden')
+  }
+
+  if (writeDecision === 'fork') {
+    const fork = await forkTemplateWorld(target, ctx.userId, worldData, now)
+    return { saved: true, worldId: fork.id, forkedFromWorldId: id, savedAt: now.toISOString() }
+  }
+
+  // Optimistic concurrency check for full-snapshot saves. The update below
+  // repeats the timestamp guard atomically so concurrent writers cannot slip
+  // between the read and write.
+  let clientLoadedDate: Date | null = null
+  if (clientLoadedAt) {
+    clientLoadedDate = new Date(clientLoadedAt)
+    if (!Number.isFinite(clientLoadedDate.getTime())) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+    }
+    if (target.updatedAt && target.updatedAt > clientLoadedDate) {
+      console.warn(`[WorldServer] ⚠️ CONFLICT on ${id}`)
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt.toISOString() }
+    }
+  }
+
+  assertNotPortalOnlyOverwrite(id, target.data, worldData)
+
+  // Auto-snapshot before overwriting
+  await snapshotBeforeSave(id)
+
+  const updateData = {
+    data: JSON.stringify(worldData),
+    objectCount: countWorldObjects(worldData),
+    updatedAt: now,
+  }
+  if (clientLoadedDate) {
+    const updated = await prisma.world.updateMany({
+      where: {
+        id,
+        updatedAt: { lte: clientLoadedDate },
+      },
+      data: updateData,
+    })
+    if (updated.count === 0) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+    }
+  } else {
+    await prisma.world.update({
+      where: { id },
+      data: updateData,
+    })
+  }
+
+  const defaultWorldSeed = await mirrorDefaultWorldSeedForSource(ctx, {
+    ...target,
+    data: JSON.stringify(worldData),
+  })
+
+  return {
+    saved: true,
+    worldId: id,
+    savedAt: now.toISOString(),
+    ...(defaultWorldSeed?.updated ? { defaultWorldSeed } : {}),
+  }
+}
+
+export async function saveWorldWithCommandEvent(
+  id: string,
+  userId: string,
+  state: Omit<WorldState, 'version' | 'savedAt'>,
+  eventInput: AppendWorldCommandEventInput,
+  clientLoadedAt?: string,
+): Promise<SaveWorldResult> {
+  const ctx = accessContext(userId)
+  const now = new Date()
+  const worldData = normalizeSavedWorldState({ version: 1, ...state, savedAt: now.toISOString() })
+
+  const target = await prisma.world.findFirst({
+    where: { id },
+    select: {
+      id: true,
+      userId: true,
+      name: true,
+      icon: true,
+      visibility: true,
+      pvpEnabled: true,
+      creatorName: true,
+      creatorAvatar: true,
+      thumbnailUrl: true,
+      updatedAt: true,
+      data: true,
+    },
+  })
+  if (!target) {
+    throw new WorldAccessError('World not found', 'world_not_found', 404)
+  }
+
+  const writeDecision = getWorldWriteDecision(ctx, toAccessSubject(target))
+  if (writeDecision === 'deny') {
+    throw new WorldAccessError('This session cannot mutate that world', 'world_write_forbidden')
+  }
+  if (writeDecision === 'fork') {
+    throw new WorldAccessError('Command writes cannot fork template worlds', 'world_command_fork_forbidden')
+  }
+
+  let clientLoadedDate: Date | null = null
+  if (clientLoadedAt) {
+    clientLoadedDate = new Date(clientLoadedAt)
+    if (!Number.isFinite(clientLoadedDate.getTime())) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+    }
+    if (target.updatedAt && target.updatedAt > clientLoadedDate) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt.toISOString() }
+    }
+  }
+
+  assertNotPortalOnlyOverwrite(id, target.data, worldData)
+  await snapshotBeforeSave(id)
+
+  const updateData = {
+    data: JSON.stringify(worldData),
+    objectCount: countWorldObjects(worldData),
+    updatedAt: now,
+  }
+  const eventData = worldCommandEventCreateData(eventInput)
+
+  const result = await prisma.$transaction(async tx => {
+    const updated = clientLoadedDate
+      ? await tx.world.updateMany({
+          where: {
+            id,
+            updatedAt: { lte: clientLoadedDate },
+          },
+          data: updateData,
+        })
+      : await tx.world.updateMany({
+          where: { id },
+          data: updateData,
+        })
+    if (updated.count === 0) return { conflict: true }
+    await tx.worldEvent.create({ data: eventData })
+    return { conflict: false }
+  })
+
+  if (result.conflict) {
+    return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+  }
+
+  const defaultWorldSeed = await mirrorDefaultWorldSeedForSource(ctx, {
+    ...target,
+    data: JSON.stringify(worldData),
+  })
+
+  return {
+    saved: true,
+    worldId: id,
+    savedAt: now.toISOString(),
+    ...(defaultWorldSeed?.updated ? { defaultWorldSeed } : {}),
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CREATE — New world
+// ═══════════════════════════════════════════════════════════════════════════
+
+function checkpointEventToInput(worldId: string, event: RoomCheckpointEventInput): AppendWorldCommandEventInput | null {
+  if (!event || event.kind !== 'command.accepted') return null
+  if (event.worldId !== worldId) return null
+  if (typeof event.id !== 'string' || typeof event.commandId !== 'string') return null
+  const command = event.command
+  const actorId = typeof event.actorId === 'string'
+    ? event.actorId
+    : typeof command?.actorId === 'string'
+      ? command.actorId
+      : ''
+  if (!actorId) return null
+  return {
+    eventId: event.id,
+    worldId,
+    commandId: event.commandId,
+    actorId,
+    sessionId: typeof command?.clientId === 'string' ? command.clientId : '',
+    kind: typeof command?.kind === 'string' ? command.kind : 'unknown',
+    worldVersion: Math.max(0, Math.floor(Number(event.revision) || 0)),
+    payload: event,
+    createdAt: typeof event.acceptedAt === 'string' ? event.acceptedAt : undefined,
+  }
+}
+
+function envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]
+  if (raw === undefined) return fallback
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase())
+}
+
+function shouldPersistRoomCheckpointEvents(): boolean {
+  return envFlag('OASIS_ROOM_CHECKPOINT_EVENTS', process.env.NODE_ENV === 'test')
+}
+
+function shouldSnapshotRoomCheckpoints(): boolean {
+  return envFlag('OASIS_ROOM_CHECKPOINT_SNAPSHOTS', process.env.NODE_ENV === 'test')
+}
+
+export async function saveWorldCheckpointWithCommandEvents(
+  id: string,
+  userId: string,
+  state: Omit<WorldState, 'version' | 'savedAt'>,
+  events: RoomCheckpointEventInput[],
+  clientLoadedAt?: string,
+): Promise<SaveWorldResult & { eventsSaved?: number; eventsSkipped?: number }> {
+  const ctx = accessContext(userId)
+  const now = new Date()
+  const worldData = normalizeSavedWorldState({ version: 1, ...state, savedAt: now.toISOString() })
+  const eventInputs = shouldPersistRoomCheckpointEvents() ? events
+    .map(event => checkpointEventToInput(id, event))
+    .filter((event): event is AppendWorldCommandEventInput => event !== null) : []
+  const skippedByPolicy = Math.max(0, events.length - eventInputs.length)
+
+  const target = await prisma.world.findFirst({
+    where: { id },
+    select: {
+      id: true,
+      userId: true,
+      name: true,
+      icon: true,
+      visibility: true,
+      pvpEnabled: true,
+      creatorName: true,
+      creatorAvatar: true,
+      thumbnailUrl: true,
+      updatedAt: true,
+      data: true,
+    },
+  })
+  if (!target) {
+    throw new WorldAccessError('World not found', 'world_not_found', 404)
+  }
+
+  const writeDecision = getWorldWriteDecision(ctx, toAccessSubject(target))
+  if (writeDecision === 'deny') {
+    throw new WorldAccessError('This session cannot mutate that world', 'world_write_forbidden')
+  }
+  if (writeDecision === 'fork') {
+    throw new WorldAccessError('Room checkpoints cannot fork template worlds', 'world_checkpoint_fork_forbidden')
+  }
+
+  let clientLoadedDate: Date | null = null
+  if (clientLoadedAt) {
+    clientLoadedDate = new Date(clientLoadedAt)
+    if (!Number.isFinite(clientLoadedDate.getTime())) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+    }
+    if (target.updatedAt && target.updatedAt > clientLoadedDate) {
+      return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt.toISOString() }
+    }
+  }
+
+  assertNotPortalOnlyOverwrite(id, target.data, worldData)
+  if (shouldSnapshotRoomCheckpoints()) {
+    await snapshotBeforeSave(id)
+  }
+
+  const updateData = {
+    data: JSON.stringify(worldData),
+    objectCount: countWorldObjects(worldData),
+    updatedAt: now,
+  }
+
+  const result = await prisma.$transaction(async tx => {
+    const updated = clientLoadedDate
+      ? await tx.world.updateMany({
+          where: {
+            id,
+            updatedAt: { lte: clientLoadedDate },
+          },
+          data: updateData,
+        })
+      : await tx.world.updateMany({
+          where: { id },
+          data: updateData,
+        })
+    if (updated.count === 0) return { conflict: true, eventsSaved: 0, eventsSkipped: 0 }
+
+    const existing = eventInputs.length > 0
+      ? await tx.worldEvent.findMany({
+          where: {
+            worldId: id,
+            commandId: { in: eventInputs.map(event => event.commandId) },
+          },
+          select: { commandId: true },
+        })
+      : []
+    const seen = new Set(existing.map(event => event.commandId))
+    let eventsSaved = 0
+    for (const eventInput of eventInputs) {
+      if (seen.has(eventInput.commandId)) continue
+      await tx.worldEvent.create({ data: worldCommandEventCreateData(eventInput) })
+      seen.add(eventInput.commandId)
+      eventsSaved += 1
+    }
+
+    return {
+      conflict: false,
+      eventsSaved,
+      eventsSkipped: skippedByPolicy + eventInputs.length - eventsSaved,
+    }
+  })
+
+  if (result.conflict) {
+    return { saved: false, conflict: true, serverUpdatedAt: target.updatedAt?.toISOString() }
+  }
+
+  const defaultWorldSeed = await mirrorDefaultWorldSeedForSource(ctx, {
+    ...target,
+    data: JSON.stringify(worldData),
+  })
+
+  return {
+    saved: true,
+    worldId: id,
+    savedAt: now.toISOString(),
+    eventsSaved: result.eventsSaved,
+    eventsSkipped: result.eventsSkipped,
+    ...(defaultWorldSeed?.updated ? { defaultWorldSeed } : {}),
+  }
+}
+
+export async function createWorld(
+  name: string,
+  icon = '🌍',
+  userId: string,
+  options: { visibility?: string; pvpEnabled?: boolean } = {},
+): Promise<WorldMeta> {
+  const ctx = accessContext(userId)
+  // An icon that arrived as "??" (its emoji lost in a shell on the way) is stored as the default instead.
+  icon = cleanWorldIcon(icon)
+  const id = `world-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+  const now = new Date()
+  const requestedVisibility = toStorageVisibility(options.visibility) || 'private'
+  const requestedKind = normalizeWorldKind(requestedVisibility)
+  const visibility = (requestedKind === 'core' || requestedKind === 'template') && !canMirrorDefaultWorldSeeds(ctx)
+    ? 'private'
+    : requestedVisibility
+  const kind = normalizeWorldKind(visibility)
+  const pvpEnabled = options.pvpEnabled ?? (kind === 'ffa' || kind === 'link-ffa')
+
+  const emptyState: WorldState = {
+    version: 1,
+    terrain: null,
+    craftedScenes: [],
+    conjuredAssetIds: [],
+    catalogPlacements: [],
+    portalGates: [createPortalZeroReturnGate(id)],
+    transforms: {},
+    lights: seedDefaultWorldLights(),
+    savedAt: now.toISOString(),
+  }
+
+  let world: Awaited<ReturnType<typeof prisma.world.create>> | null = null
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      world = await prisma.world.create({
+        data: {
+          id,
+          shortCode: await generateWorldShortCode(),
+          userId,
+          name,
+          icon,
+          visibility,
+          pvpEnabled,
+          data: JSON.stringify(emptyState),
+          createdAt: now,
+          updatedAt: now,
+        },
+      })
+      break
+    } catch (error) {
+      if (isWorldShortCodeCollision(error)) continue
+      throw error
+    }
+  }
+  if (!world) throw new Error('Could not create world with a unique short code.')
+
+  console.log(`[WorldServer] Created world "${name}" (${id}) for user ${userId}`)
+  await mirrorDefaultWorldSeedForSource(ctx, {
+    id: world.id,
+    userId: world.userId,
+    name: world.name,
+    icon: world.icon,
+    visibility: world.visibility,
+    pvpEnabled: world.pvpEnabled,
+    creatorName: world.creatorName,
+    creatorAvatar: world.creatorAvatar,
+    thumbnailUrl: world.thumbnailUrl,
+    data: world.data,
+  })
+  return toWorldMeta(world, ctx)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DELETE
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function deleteWorld(id: string, userId?: string): Promise<void> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) return
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+  await prisma.world.deleteMany({ where: { id } })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISIBILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function setWorldVisibility(
+  id: string,
+  userId: string,
+  visibility: string
+): Promise<void> {
+  const nextVisibility = toStorageVisibility(visibility)
+  if (!nextVisibility) {
+    throw new WorldAccessError('Unsupported world visibility', 'invalid_world_visibility', 400)
+  }
+
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true, pvpEnabled: true },
+  })
+  if (!world) {
+    throw new WorldAccessError('World not found', 'world_not_found', 404)
+  }
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  const nextKind = normalizeWorldKind(nextVisibility)
+  if (!canMirrorDefaultWorldSeeds(ctx) && (nextKind === 'core' || nextKind === 'template')) {
+    throw new WorldAccessError('Only local mode or hosted admin can mark core or template worlds', 'system_visibility_forbidden')
+  }
+
+  // Sandbox = PvP-by-default. Flipping a non-sandbox world to public_edit
+  // auto-enables PvP unless the owner has already toggled it on/off. We
+  // only flip when the *previous* visibility wasn't already public_edit
+  // (otherwise re-saving visibility would clobber a deliberate off toggle).
+  const becomingSandbox = nextVisibility === 'public_edit' && world.visibility !== 'public_edit'
+  const data: { visibility: string; creatorName: string; updatedAt: Date; pvpEnabled?: boolean } = {
+    visibility: nextVisibility,
+    creatorName: 'Player 1',
+    updatedAt: new Date(),
+  }
+  if (becomingSandbox && !world.pvpEnabled) {
+    data.pvpEnabled = true
+  }
+
+  await prisma.world.updateMany({
+    where: { id },
+    data,
+  })
+  await mirrorDefaultWorldSeedById(ctx, id)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PVP TOGGLE — owner-controlled, independent of visibility
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function setWorldPvpEnabled(
+  id: string,
+  userId: string,
+  enabled: boolean,
+): Promise<boolean> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) {
+    throw new WorldAccessError('World not found', 'world_not_found', 404)
+  }
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  await prisma.world.updateMany({
+    where: { id },
+    data: { pvpEnabled: enabled, updatedAt: new Date() },
+  })
+  await mirrorDefaultWorldSeedById(ctx, id)
+  return enabled
+}
+
+export interface WorldLikeResult {
+  liked: boolean
+  likeCount: number
+}
+
+export async function setWorldLiked(
+  id: string,
+  userId: string,
+  liked: boolean,
+): Promise<WorldLikeResult> {
+  const ctx = accessContext(userId)
+
+  return prisma.$transaction(async tx => {
+    const world = await tx.world.findFirst({
+      where: { id },
+      select: { id: true, userId: true, visibility: true, likeCount: true },
+    })
+    if (!world) {
+      throw new WorldAccessError('World not found', 'world_not_found', 404)
+    }
+    if (!canReadWorld(ctx, toAccessSubject(world))) {
+      throw new WorldAccessError('World not found', 'world_not_found', 404)
+    }
+
+    const existing = await tx.worldLike.findUnique({
+      where: { worldId_userId: { worldId: id, userId } },
+      select: { id: true },
+    })
+
+    if (liked) {
+      if (!existing) {
+        await tx.worldLike.create({ data: { worldId: id, userId } })
+      }
+    } else if (existing) {
+      await tx.worldLike.delete({ where: { id: existing.id } })
+    }
+
+    const likeCount = await tx.worldLike.count({ where: { worldId: id } })
+    await tx.world.update({
+      where: { id },
+      data: { likeCount },
+      select: { id: true },
+    })
+
+    return { liked, likeCount }
+  })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// METADATA — settings changes use stricter owner/system permissions.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function updateWorldMetadata(
+  id: string,
+  userId: string,
+  updates: { name?: string; icon?: string },
+): Promise<boolean> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) return false
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  const data: Record<string, string | Date> = { updatedAt: new Date() }
+  if (updates.name?.trim()) data.name = updates.name.trim().slice(0, 50)
+  if (updates.icon) data.icon = updates.icon
+  if (Object.keys(data).length === 1) return false
+
+  const result = await prisma.world.updateMany({
+    where: { id },
+    data,
+  })
+  if (result.count > 0) {
+    await mirrorDefaultWorldSeedById(ctx, id)
+  }
+  return result.count > 0
+}
+
+// SAVE OPEN-BUILD - anyone can edit if visibility is ffa/public_edit/unlisted_edit.
+export async function savePublicEditWorld(
+  id: string,
+  state: Omit<WorldState, 'version' | 'savedAt'>
+): Promise<boolean> {
+  const now = new Date()
+  const worldData = normalizeSavedWorldState({ version: 1, ...state, savedAt: now.toISOString() })
+
+  const current = await prisma.world.findFirst({
+    where: { id, visibility: { in: FFA_VISIBILITIES } },
+    select: { data: true },
+  })
+  assertNotPortalOnlyOverwrite(id, current?.data, worldData)
+
+  await snapshotBeforeSave(id)
+
+  const result = await prisma.world.updateMany({
+    where: { id, visibility: { in: FFA_VISIBILITIES } },
+    data: {
+      data: JSON.stringify(worldData),
+      objectCount: countWorldObjects(worldData),
+      updatedAt: now,
+    },
+  })
+
+  return result.count > 0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISIT COUNTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function recordVisit(worldId: string): Promise<void> {
+  await prisma.world.update({
+    where: { id: worldId },
+    data: { visitCount: { increment: 1 } },
+  }).catch(() => {}) // fire-and-forget
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOAD PUBLIC — no user_id check (for explore/view)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function loadPublicWorld(id: string): Promise<{ state: WorldState; meta: WorldMeta & { creator_name?: string; creator_avatar?: string } } | null> {
+  const world = await prisma.world.findFirst({
+    where: { id, visibility: { in: PUBLICLY_READABLE_VISIBILITIES } },
+  })
+
+  if (!world?.data) return null
+  const profiles = await getOwnerProfiles([world.userId])
+
+  return {
+    state: normalizeSavedWorldState(JSON.parse(world.data) as WorldState),
+    meta: {
+      ...toWorldMeta(world, undefined, profiles.get(world.userId)),
+    },
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UPDATE OBJECT COUNT
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function updateObjectCount(id: string, userId: string, count: number): Promise<void> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) return
+  const decision = getWorldWriteDecision(ctx, toAccessSubject(world))
+  if (decision === 'deny' || decision === 'fork') return
+  await prisma.world.updateMany({
+    where: { id },
+    data: { objectCount: count },
+  })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASSET USAGE — Count how many times an asset appears across ALL worlds
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface AssetUsageResult {
+  totalCount: number
+  worldCount: number
+  currentWorldCount: number
+}
+
+/**
+ * Count how many times an asset URL or conjured asset ID is used across all worlds.
+ * Searches catalogPlacements (imageUrl/videoUrl/audioUrl), behaviors (audioUrl),
+ * and customGroundPresets (customTextureUrl) for media.
+ * Searches conjuredAssetIds for conjured assets.
+ */
+export async function countAssetUsageAcrossWorlds(
+  userId: string,
+  assetUrl: string,
+  currentWorldId: string,
+  type: 'media' | 'conjured' = 'media'
+): Promise<AssetUsageResult> {
+  const worlds = await prisma.world.findMany({
+    where: { userId },
+    select: { id: true, data: true },
+  })
+
+  let totalCount = 0
+  let worldCount = 0
+  let currentWorldCount = 0
+
+  for (const world of worlds) {
+    if (!world.data) continue
+    try {
+      const state = normalizeSavedWorldState(JSON.parse(world.data) as WorldState)
+      let count = 0
+
+      if (type === 'media') {
+        // 1. catalogPlacements — imageUrl, videoUrl, audioUrl
+        count += (state.catalogPlacements || []).filter(
+          p => p.imageUrl === assetUrl || p.videoUrl === assetUrl || p.audioUrl === assetUrl
+        ).length
+
+        // 2. behaviors — audioUrl on any object (loudspeakers via behavior system)
+        if (state.behaviors) {
+          for (const b of Object.values(state.behaviors)) {
+            if (b && b.audioUrl === assetUrl) count++
+          }
+        }
+
+        // 3. customGroundPresets — images used as ground tiles
+        if (state.customGroundPresets) {
+          count += state.customGroundPresets.filter(
+            p => p.customTextureUrl === assetUrl
+          ).length
+        }
+      } else {
+        // Count in conjuredAssetIds — match asset ID
+        count = (state.conjuredAssetIds || []).filter(id => id === assetUrl).length
+      }
+
+      if (count > 0) {
+        totalCount += count
+        worldCount++
+        if (world.id === currentWorldId) currentWorldCount = count
+      }
+    } catch { /* skip corrupt world data */ }
+  }
+
+  return { totalCount, worldCount, currentWorldCount }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SNAPSHOTS — Auto-backup. Born from pain.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function snapshotBeforeSave(worldId: string, userId?: string): Promise<void> {
+  try {
+    // Throttle — skip if last snapshot is < 5 min old
+    const lastSnap = await prisma.worldSnapshot.findFirst({
+      where: { worldId },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    })
+
+    if (lastSnap?.createdAt) {
+      const elapsed = Date.now() - lastSnap.createdAt.getTime()
+      if (elapsed < SNAPSHOT_THROTTLE_MS) return
+    }
+
+    // Fetch current state
+    const where: { id: string; userId?: string } = { id: worldId }
+    if (userId) where.userId = userId
+    const current = await prisma.world.findFirst({ where, select: { data: true } })
+
+    if (!current?.data) return
+
+    const worldData = JSON.parse(current.data) as WorldState
+    const objectCount =
+      (worldData.conjuredAssetIds?.length || 0) +
+      (worldData.catalogPlacements?.length || 0) +
+      (worldData.craftedScenes?.length || 0)
+
+    // Skip empty worlds
+    if (objectCount === 0 && !worldData.terrain && (worldData.groundPresetId || 'none') === 'none') return
+
+    // Insert snapshot
+    await prisma.worldSnapshot.create({
+      data: { worldId, data: current.data, objectCount, source: 'auto' },
+    })
+
+    // Prune old snapshots
+    const allSnapshots = await prisma.worldSnapshot.findMany({
+      where: { worldId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    })
+
+    if (allSnapshots.length > MAX_SNAPSHOTS_PER_WORLD) {
+      const toDelete = allSnapshots.slice(MAX_SNAPSHOTS_PER_WORLD).map(s => s.id)
+      await prisma.worldSnapshot.deleteMany({ where: { id: { in: toDelete } } })
+    }
+  } catch (err) {
+    console.error(`[WorldServer] Snapshot failed for ${worldId}:`, err)
+  }
+}
+
+export async function listSnapshots(worldId: string, userId: string): Promise<SnapshotMeta[]> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id: worldId },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) return []
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  const snapshots = await prisma.worldSnapshot.findMany({
+    where: { worldId },
+    orderBy: { createdAt: 'desc' },
+    take: MAX_SNAPSHOTS_PER_WORLD,
+    select: { id: true, worldId: true, objectCount: true, source: true, createdAt: true },
+  })
+
+  return snapshots.map(s => ({
+    id: s.id,
+    world_id: s.worldId,
+    object_count: s.objectCount,
+    source: s.source as 'auto' | 'manual',
+    created_at: s.createdAt.toISOString(),
+  }))
+}
+
+export async function loadSnapshot(snapshotId: string): Promise<WorldState | null> {
+  const snap = await prisma.worldSnapshot.findUnique({
+    where: { id: snapshotId },
+    select: { data: true },
+  })
+  if (!snap?.data) return null
+  return normalizeSavedWorldState(JSON.parse(snap.data) as WorldState)
+}
+
+export async function restoreSnapshot(
+  worldId: string,
+  userId: string,
+  snapshotId: string
+): Promise<boolean> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id: worldId },
+    select: { id: true, userId: true, visibility: true },
+  })
+  if (!world) return false
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  const snapshotState = await loadSnapshot(snapshotId)
+  if (!snapshotState) return false
+
+  // Snapshot current state first (undo safety)
+  await snapshotBeforeSave(worldId)
+
+  const now = new Date()
+  const worldData = normalizeSavedWorldState({ ...snapshotState, savedAt: now.toISOString() })
+  await prisma.world.updateMany({
+    where: { id: worldId },
+    data: {
+      data: JSON.stringify(worldData),
+      objectCount: countWorldObjects(worldData),
+      updatedAt: now,
+    },
+  })
+
+  console.log(`[WorldServer] ✅ Restored snapshot ${snapshotId} → world ${worldId}`)
+  await mirrorDefaultWorldSeedById(ctx, worldId)
+  return true
+}
+
+export async function createManualSnapshot(worldId: string, userId: string): Promise<{ ok: true; objectCount: number } | null> {
+  const ctx = accessContext(userId)
+  const world = await prisma.world.findFirst({
+    where: { id: worldId },
+    select: { id: true, userId: true, visibility: true, data: true },
+  })
+  if (!world?.data) return null
+  assertCanEditWorldSettings(ctx, toAccessSubject(world))
+
+  const worldState = normalizeSavedWorldState(JSON.parse(world.data) as WorldState)
+  const objectCount = countWorldObjects(worldState)
+  await prisma.worldSnapshot.create({
+    data: {
+      worldId,
+      data: JSON.stringify(worldState),
+      objectCount,
+      source: 'manual',
+    },
+  })
+  return { ok: true, objectCount }
+}
+
+// ▓▓▓▓【W̸O̸R̸L̸D̸】▓▓▓▓ॐ▓▓▓▓【S̸E̸R̸V̸E̸R̸】▓▓▓▓

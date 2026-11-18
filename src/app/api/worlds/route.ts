@@ -1,0 +1,121 @@
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// THE FORGE — World Persistence API
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+//
+//   GET  /api/worlds        — List all worlds for current user
+//   POST /api/worlds        — Create new world / import
+//
+// ░▒▓█ WORLDS ROUTE █▓▒░
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+import { NextResponse } from 'next/server'
+import { recordOasisAnalyticsEvent } from '@/lib/oasis-analytics'
+import { getRequiredOasisUserId } from '@/lib/session'
+import {
+  getRegistry, createWorld, saveWorld,
+  type WorldState,
+} from '@/lib/forge/world-server'
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/worlds — All worlds for the authenticated user
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function GET(request: Request) {
+  try {
+    const userId = getRequiredOasisUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'oasis_session cookie required' }, { status: 401 })
+    }
+
+    const registry = await getRegistry(userId)
+    return NextResponse.json(registry)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[Worlds] GET error:', msg)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /api/worlds — Create a new world OR import one
+//
+// Body (create):  { name: string, icon?: string, visibility?: string }
+// Body (import):  { import: true, meta?: WorldMeta, state: WorldState }
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function POST(request: Request) {
+  try {
+    const userId = getRequiredOasisUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'oasis_session cookie required' }, { status: 401 })
+    }
+    const body = await request.json()
+
+    // ░▒▓ Import path ▓▒░
+    if (body.import && body.state) {
+      const state = body.state as WorldState
+      if (state.version !== 1) {
+        return NextResponse.json({ error: 'Invalid world version' }, { status: 400 })
+      }
+      const name = body.meta?.name || 'Imported World'
+      const icon = body.meta?.icon || '📦'
+      const meta = await createWorld(name, icon, userId)
+      await saveWorld(meta.id, userId, {
+        terrain: state.terrain,
+        terrainHeights: state.terrainHeights,
+        craftedScenes: state.craftedScenes || [],
+        conjuredAssetIds: state.conjuredAssetIds || [],
+        catalogPlacements: state.catalogPlacements || [],
+        portalGates: state.portalGates || [],
+        spatialWebObjects: state.spatialWebObjects || [],
+        transforms: state.transforms || {},
+        behaviors: state.behaviors,
+        groundPresetId: state.groundPresetId,
+        groundTiles: state.groundTiles,
+        lights: state.lights,
+        skyBackgroundId: state.skyBackgroundId,
+        customGroundPresets: state.customGroundPresets,
+        agentWindows: state.agentWindows || [],
+        agentAvatars: state.agentAvatars || [],
+        paintStrokes: state.paintStrokes || [],
+        text3dObjects: state.text3dObjects || [],
+      })
+      await recordOasisAnalyticsEvent({
+        request,
+        eventType: 'world_imported',
+        worldId: meta.id,
+        source: 'worlds-route',
+        metadata: {
+          name,
+          objectCount: (state.catalogPlacements?.length || 0) + (state.craftedScenes?.length || 0),
+        },
+      })
+      return NextResponse.json(meta, { status: 201 })
+    }
+
+    // ░▒▓ Create path ▓▒░
+    if (!body.name || typeof body.name !== 'string') {
+      return NextResponse.json({ error: 'Missing "name" field' }, { status: 400 })
+    }
+
+    const meta = await createWorld(body.name, body.icon || '🌍', userId, { visibility: body.visibility })
+    await recordOasisAnalyticsEvent({
+      request,
+      eventType: 'world_created',
+      worldId: meta.id,
+      source: 'worlds-route',
+      metadata: {
+        name: meta.name,
+        visibility: meta.visibility,
+      },
+    })
+    return NextResponse.json(meta, { status: 201 })
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[Worlds] POST error:', msg)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+// ▓▓▓▓【W̸O̸R̸L̸D̸S̸】▓▓▓▓ॐ▓▓▓▓【R̸O̸U̸T̸E̸】▓▓▓▓

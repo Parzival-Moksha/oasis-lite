@@ -1,0 +1,515 @@
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// AUDIO MANAGER — Sound effects for the Oasis
+// ─═̷─═̷─ॐ─═̷─═̷─ Every action has a voice ─═̷─═̷─ॐ─═̷─═̷─
+//
+// Event-driven: subscribes to EventBus commands + custom triggers.
+// Per-event sound selection: each event has multiple sound options.
+// User picks their preferred sound per event in Settings.
+// Volume + mute controls. Persisted to localStorage.
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+import { create } from 'zustand'
+import { eventBus, type OasisCommand } from './event-bus'
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SOUND EVENTS — every triggerable sound in the system
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type SoundEvent =
+  | 'select'        // Object selected
+  | 'deselect'      // Object deselected
+  | 'place'         // Object placed in world
+  | 'delete'        // Object deleted
+  | 'panelOpen'     // Any panel opens
+  | 'panelClose'    // Any panel closes
+  | 'buttonClick'   // UI button clicked
+  | 'buttonHover'   // UI button hovered
+  | 'modeSwitch'    // Camera mode changed
+  | 'conjureStart'  // Conjuration started
+  | 'conjureDone'   // Conjuration completed
+  | 'fireboltCast'  // Firebolt cast whoosh
+  | 'fireboltHit'   // Firebolt impact
+  | 'fireboltVoice' // Player callout for firebolt
+  | 'manaRecharge'  // Mana recharge chant/voice
+  | 'objectiveAchieved' // Quest objective completed
+  | 'anorakDone'    // Anorak finished response
+  | 'notification'  // DevCraft timer, mission complete
+  | 'connected'     // Agent/world link established
+  | 'levelUp'       // Player level increased
+  | 'winner'        // Successful form/world milestone
+  | 'chooseCharacter' // Self avatar picker opened
+  | 'undo'          // Undo action
+  | 'redo'          // Redo action
+  | 'agentFocus'    // Enter zoomon mode
+  | 'agentUnfocus'  // Exit zoomon mode
+  | 'tilePaint'     // Ground tile painted
+  | 'error'         // Error occurred
+  | 'footstep'      // Avatar footstep (TPS mode)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SOUND OPTIONS — available sounds per event
+// Each event has multiple choices. User picks one in Settings.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const UI = '/audio/kenney-ui/Audio'
+const RPG = '/audio/kenney-rpg/Audio'
+const INTERFACE = '/audio/kenney_interface-sounds/Audio'
+const FIGHTER = '/audio/kenney_voiceover-pack-fighter'
+const IMPACT = '/audio/kenney_impact-sounds/Audio'
+
+export interface SoundOption {
+  id: string
+  label: string
+  path: string
+}
+
+export const SOUND_OPTIONS: Record<SoundEvent, SoundOption[]> = {
+  select:       [{ id: 'click1', label: 'Click 1', path: `${UI}/click1.ogg` }, { id: 'click2', label: 'Click 2', path: `${UI}/click2.ogg` }, { id: 'click3', label: 'Click 3', path: `${UI}/click3.ogg` }, { id: 'click4', label: 'Click 4', path: `${UI}/click4.ogg` }, { id: 'click5', label: 'Click 5', path: `${UI}/click5.ogg` }],
+  deselect:     [{ id: 'release1', label: 'Release', path: `${UI}/mouserelease1.ogg` }, { id: 'click3', label: 'Soft Click', path: `${UI}/click3.ogg` }],
+  place:        [{ id: 'place1', label: 'Book Place 1', path: `${RPG}/bookPlace1.ogg` }, { id: 'place2', label: 'Book Place 2', path: `${RPG}/bookPlace2.ogg` }, { id: 'place3', label: 'Book Place 3', path: `${RPG}/bookPlace3.ogg` }, { id: 'dropLeather', label: 'Drop Leather', path: `${RPG}/dropLeather.ogg` }, { id: 'interfaceDrop1', label: 'Interface Drop 1', path: `${INTERFACE}/drop_001.ogg` }, { id: 'interfaceDrop2', label: 'Interface Drop 2', path: `${INTERFACE}/drop_002.ogg` }, { id: 'interfaceDrop3', label: 'Interface Drop 3', path: `${INTERFACE}/drop_003.ogg` }, { id: 'interfaceDrop4', label: 'Interface Drop 4', path: `${INTERFACE}/drop_004.ogg` }, { id: 'interfacePluck1', label: 'Interface Pluck 1', path: `${INTERFACE}/pluck_001.ogg` }, { id: 'interfacePluck2', label: 'Interface Pluck 2', path: `${INTERFACE}/pluck_002.ogg` }],
+  delete:       [{ id: 'chop', label: 'Chop', path: `${RPG}/chop.ogg` }, { id: 'knife', label: 'Knife Slice', path: `${RPG}/knifeSlice.ogg` }],
+  panelOpen:    [{ id: 'open1', label: 'Book Open', path: `${RPG}/bookOpen.ogg` }, { id: 'door1', label: 'Door Open', path: `${RPG}/doorOpen_1.ogg` }, { id: 'creak1', label: 'Creak', path: `${RPG}/creak1.ogg` }],
+  panelClose:   [{ id: 'close1', label: 'Book Close', path: `${RPG}/bookClose.ogg` }, { id: 'door1', label: 'Door Close', path: `${RPG}/doorClose_1.ogg` }],
+  buttonClick:  [
+    { id: 'menuHitToggle3', label: 'Menu Hit Toggle 3', path: `${INTERFACE}/toggle_003.ogg` },
+    { id: 'menuHitToggle2', label: 'Menu Hit Toggle 2', path: `${INTERFACE}/toggle_002.ogg` },
+    { id: 'menuHitClick4', label: 'Menu Hit Click 4', path: `${INTERFACE}/click_004.ogg` },
+    { id: 'menuHitClick5', label: 'Menu Hit Click 5', path: `${INTERFACE}/click_005.ogg` },
+    { id: 'menuHitDrop1', label: 'Menu Hit Drop 1', path: `${INTERFACE}/drop_001.ogg` },
+    { id: 'menuHitDrop2', label: 'Menu Hit Drop 2', path: `${INTERFACE}/drop_002.ogg` },
+    { id: 'menuHitSelect4', label: 'Menu Hit Select 4', path: `${INTERFACE}/select_004.ogg` },
+    { id: 'menuHitSelect5', label: 'Menu Hit Select 5', path: `${INTERFACE}/select_005.ogg` },
+    { id: 'menuHitPluck2', label: 'Menu Hit Pluck 2', path: `${INTERFACE}/pluck_002.ogg` },
+    { id: 'menuConfirm1', label: 'Menu Confirm 1', path: `${INTERFACE}/confirmation_001.ogg` },
+    { id: 'menuConfirm2', label: 'Menu Confirm 2', path: `${INTERFACE}/confirmation_002.ogg` },
+    { id: 'menuOpen3', label: 'Menu Open 3', path: `${INTERFACE}/open_003.ogg` },
+  ],
+  buttonHover:  [
+    { id: 'hoverTick1', label: 'Hover Tick 1', path: `${INTERFACE}/tick_001.ogg` },
+    { id: 'hoverTick2', label: 'Hover Tick 2', path: `${INTERFACE}/tick_002.ogg` },
+    { id: 'hoverSelect1', label: 'Hover Select 1', path: `${INTERFACE}/select_001.ogg` },
+    { id: 'hoverSelect2', label: 'Hover Select 2', path: `${INTERFACE}/select_002.ogg` },
+    { id: 'hoverSelect3', label: 'Hover Select 3', path: `${INTERFACE}/select_003.ogg` },
+    { id: 'hoverSelect6', label: 'Hover Select 6', path: `${INTERFACE}/select_006.ogg` },
+    { id: 'hoverSelect7', label: 'Hover Select 7', path: `${INTERFACE}/select_007.ogg` },
+    { id: 'hoverSelect8', label: 'Hover Select 8', path: `${INTERFACE}/select_008.ogg` },
+    { id: 'hoverScroll2', label: 'Hover Scroll 2', path: `${INTERFACE}/scroll_002.ogg` },
+    { id: 'hoverScroll5', label: 'Hover Scroll 5', path: `${INTERFACE}/scroll_005.ogg` },
+  ],
+  modeSwitch:   [{ id: 'sw6', label: 'Switch 6', path: `${UI}/switch6.ogg` }, { id: 'sw7', label: 'Switch 7', path: `${UI}/switch7.ogg` }, { id: 'sw8', label: 'Switch 8', path: `${UI}/switch8.ogg` }, { id: 'sw9', label: 'Switch 9', path: `${UI}/switch9.ogg` }],
+  conjureStart: [{ id: 'draw1', label: 'Draw Knife 1', path: `${RPG}/drawKnife1.ogg` }, { id: 'draw2', label: 'Draw Knife 2', path: `${RPG}/drawKnife2.ogg` }, { id: 'belt', label: 'Belt Handle', path: `${RPG}/beltHandle1.ogg` }],
+  conjureDone:  [{ id: 'latch', label: 'Metal Latch', path: `${RPG}/metalLatch.ogg` }, { id: 'coins', label: 'Coins', path: `${RPG}/handleCoins.ogg` }],
+  fireboltCast: [
+    { id: 'powerUpFemale', label: 'Power Up Female', path: '/audio/kenney_voiceover-pack/Female/power_up.ogg' },
+    { id: 'powerUpMale', label: 'Power Up Male', path: '/audio/kenney_voiceover-pack/Male/power_up.ogg' },
+    { id: 'fight', label: 'Fight', path: `${FIGHTER}/fight.ogg` },
+  ],
+  fireboltHit: [
+    { id: 'genericLight0', label: 'Generic Light 0', path: `${IMPACT}/impactGeneric_light_000.ogg` },
+    { id: 'softMedium0', label: 'Soft Medium 0', path: `${IMPACT}/impactSoft_medium_000.ogg` },
+    { id: 'woodMedium0', label: 'Wood Medium 0', path: `${IMPACT}/impactWood_medium_000.ogg` },
+  ],
+  fireboltVoice: [
+    { id: 'suppressingFireFemale', label: 'Suppressing Fire Female', path: '/audio/kenney_voiceover-pack/Female/war_supressing_fire.ogg' },
+    { id: 'suppressingFireMale', label: 'Suppressing Fire Male', path: '/audio/kenney_voiceover-pack/Male/war_suppressing_fire.ogg' },
+    { id: 'fireInHoleFemale', label: 'Fire Call Female', path: '/audio/kenney_voiceover-pack/Female/war_fire_in_the_hole.ogg' },
+    { id: 'fireInHoleMale', label: 'Fire Call Male', path: '/audio/kenney_voiceover-pack/Male/war_fire_in_the_hole.ogg' },
+  ],
+  manaRecharge: [
+    { id: 'manaPowerFemale', label: 'Mana Power Female', path: '/audio/kenney_voiceover-pack/Female/power_up.ogg' },
+    { id: 'manaPowerMale', label: 'Mana Power Male', path: '/audio/kenney_voiceover-pack/Male/power_up.ogg' },
+  ],
+  objectiveAchieved: [
+    { id: 'objectiveFemale', label: 'Objective Achieved Female', path: '/audio/kenney_voiceover-pack/Female/objective_achieved.ogg' },
+    { id: 'missionFemale', label: 'Mission Complete Female', path: '/audio/kenney_voiceover-pack/Female/mission_completed.ogg' },
+  ],
+  anorakDone:   [{ id: 'coins', label: 'Coins', path: `${RPG}/handleCoins.ogg` }, { id: 'latch', label: 'Metal Latch', path: `${RPG}/metalLatch.ogg` }, { id: 'book', label: 'Book Close', path: `${RPG}/bookClose.ogg` }],
+  notification: [
+    { id: 'metal', label: 'Metal Click', path: `${RPG}/metalClick.ogg` }, { id: 'coins2', label: 'Coins 2', path: `${RPG}/handleCoins2.ogg` },
+    { id: 'sw10', label: 'Switch 10', path: `${UI}/switch10.ogg` }, { id: 'sw15', label: 'Switch 15', path: `${UI}/switch15.ogg` },
+    { id: 'sw20', label: 'Switch 20', path: `${UI}/switch20.ogg` }, { id: 'sw25', label: 'Switch 25', path: `${UI}/switch25.ogg` },
+    { id: 'sw30', label: 'Switch 30', path: `${UI}/switch30.ogg` }, { id: 'sw35', label: 'Switch 35', path: `${UI}/switch35.ogg` },
+    { id: 'sw38', label: 'Switch 38', path: `${UI}/switch38.ogg` }, { id: 'latch', label: 'Metal Latch', path: `${RPG}/metalLatch.ogg` },
+    { id: 'pot1', label: 'Metal Pot 1', path: `${RPG}/metalPot1.ogg` }, { id: 'pot2', label: 'Metal Pot 2', path: `${RPG}/metalPot2.ogg` },
+    { id: 'pot3', label: 'Metal Pot 3', path: `${RPG}/metalPot3.ogg` }, { id: 'coins1', label: 'Coins 1', path: `${RPG}/handleCoins.ogg` },
+    { id: 'door1', label: 'Door Open', path: `${RPG}/doorOpen_1.ogg` }, { id: 'bookClose', label: 'Book Close', path: `${RPG}/bookClose.ogg` },
+    { id: 'click5', label: 'Click 5', path: `${UI}/click5.ogg` },
+  ],
+  connected: [
+    { id: 'fighterReady', label: 'Ready', path: `${FIGHTER}/ready.ogg` },
+    { id: 'confirm1', label: 'Confirmation 1', path: `${INTERFACE}/confirmation_001.ogg` },
+    { id: 'confirm2', label: 'Confirmation 2', path: `${INTERFACE}/confirmation_002.ogg` },
+    { id: 'confirm3', label: 'Confirmation 3', path: `${INTERFACE}/confirmation_003.ogg` },
+    { id: 'complete', label: 'Mission Complete', path: '/audio/kenney_voiceover-pack/Female/mission_completed.ogg' },
+  ],
+  levelUp: [
+    { id: 'femaleLevelUp', label: 'Level Up Female', path: '/audio/kenney_voiceover-pack/Female/level_up.ogg' },
+    { id: 'maleLevelUp', label: 'Level Up Male', path: '/audio/kenney_voiceover-pack/Male/level_up.ogg' },
+  ],
+  winner: [
+    { id: 'fighterWinner', label: 'Winner', path: `${FIGHTER}/winner.ogg` },
+    { id: 'femaleYouWin', label: 'You Win Female', path: '/audio/kenney_voiceover-pack/Female/you_win.ogg' },
+    { id: 'fighterYouWin', label: 'You Win', path: `${FIGHTER}/you_win.ogg` },
+  ],
+  chooseCharacter: [
+    { id: 'fighterChoose', label: 'Choose Character', path: `${FIGHTER}/choose_your_character.ogg` },
+  ],
+  undo:         [{ id: 'sw11', label: 'Switch 11', path: `${UI}/switch11.ogg` }, { id: 'sw12', label: 'Switch 12', path: `${UI}/switch12.ogg` }],
+  redo:         [{ id: 'sw13', label: 'Switch 13', path: `${UI}/switch13.ogg` }, { id: 'sw14', label: 'Switch 14', path: `${UI}/switch14.ogg` }],
+  agentFocus:   [{ id: 'open1', label: 'Door Open', path: `${RPG}/doorOpen_1.ogg` }, { id: 'open2', label: 'Door Open 2', path: `${RPG}/doorOpen_2.ogg` }],
+  agentUnfocus: [{ id: 'close1', label: 'Door Close', path: `${RPG}/doorClose_1.ogg` }, { id: 'close2', label: 'Door Close 2', path: `${RPG}/doorClose_2.ogg` }],
+  tilePaint:    [{ id: 'cloth1', label: 'Cloth 1', path: `${RPG}/cloth1.ogg` }, { id: 'cloth2', label: 'Cloth 2', path: `${RPG}/cloth2.ogg` }, { id: 'cloth3', label: 'Cloth 3', path: `${RPG}/cloth3.ogg` }],
+  error:        [{ id: 'pot1', label: 'Metal Pot 1', path: `${RPG}/metalPot1.ogg` }, { id: 'pot2', label: 'Metal Pot 2', path: `${RPG}/metalPot2.ogg` }],
+  footstep:     [{ id: 'step0', label: 'Step 0', path: `${RPG}/footstep00.ogg` }, { id: 'step1', label: 'Step 1', path: `${RPG}/footstep01.ogg` }, { id: 'step2', label: 'Step 2', path: `${RPG}/footstep02.ogg` }, { id: 'step3', label: 'Step 3', path: `${RPG}/footstep03.ogg` }, { id: 'step4', label: 'Step 4', path: `${RPG}/footstep04.ogg` }],
+}
+
+const DEFAULT_VOLUME = 0.5
+const DEFAULT_MUTED = false
+
+// Default sound profile for fresh clones and deployed first-time visitors.
+const DEFAULT_SELECTIONS: Record<SoundEvent, string> = {
+  select: 'click1',
+  deselect: 'release1',
+  place: 'place1',
+  delete: 'chop',
+  panelOpen: 'open1',
+  panelClose: 'close1',
+  buttonClick: 'menuHitToggle3',
+  buttonHover: 'hoverTick1',
+  modeSwitch: 'sw6',
+  conjureStart: 'draw1',
+  conjureDone: 'latch',
+  fireboltCast: 'powerUpFemale',
+  fireboltHit: 'genericLight0',
+  fireboltVoice: 'suppressingFireFemale',
+  manaRecharge: 'manaPowerFemale',
+  objectiveAchieved: 'objectiveFemale',
+  anorakDone: 'coins',
+  notification: 'metal',
+  connected: 'fighterReady',
+  levelUp: 'femaleLevelUp',
+  winner: 'fighterWinner',
+  chooseCharacter: 'fighterChoose',
+  undo: 'sw11',
+  redo: 'sw13',
+  agentFocus: 'open1',
+  agentUnfocus: 'close1',
+  tilePaint: 'cloth1',
+  error: 'pot1',
+  footstep: 'step0',
+}
+
+function createDefaultAudioSettings() {
+  return {
+    volume: DEFAULT_VOLUME,
+    muted: DEFAULT_MUTED,
+    selections: { ...DEFAULT_SELECTIONS },
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIO CACHE — pre-loaded HTMLAudioElement pool
+// ═══════════════════════════════════════════════════════════════════════════
+
+const audioCache = new Map<string, HTMLAudioElement>()
+const brokenPaths = new Set<string>()
+const lastPlayedAt = new Map<SoundEvent, number>()
+
+function getSoundCooldownMs(event: SoundEvent): number {
+  if (event === 'buttonHover') return 0
+  if (event === 'footstep') return 80
+  if (event === 'fireboltVoice') return 900
+  if (event === 'manaRecharge') return 1600
+  if (event === 'objectiveAchieved') return 1200
+  return 0
+}
+
+function getSoundVolumeMultiplier(event: SoundEvent): number {
+  if (event === 'buttonHover') return 0.08
+  if (event === 'buttonClick') return 0.82
+  if (event === 'fireboltVoice') return 0.78
+  if (event === 'fireboltHit') return 0.7
+  if (event === 'manaRecharge') return 0.72
+  if (event === 'objectiveAchieved') return 0.9
+  return 1
+}
+
+function isEventStillAudible(event: SoundEvent, audio: HTMLAudioElement): boolean {
+  void event
+  void audio
+  return false
+}
+
+function shouldSkipForCooldown(event: SoundEvent): boolean {
+  const cooldown = getSoundCooldownMs(event)
+  if (cooldown <= 0 || typeof performance === 'undefined') return false
+  const now = performance.now()
+  const last = lastPlayedAt.get(event) || 0
+  if (now - last < cooldown) return true
+  lastPlayedAt.set(event, now)
+  return false
+}
+
+function getAudio(path: string): HTMLAudioElement {
+  let audio = audioCache.get(path)
+  if (!audio) {
+    audio = new Audio(path)
+    audio.preload = 'auto'
+    audio.addEventListener('error', () => brokenPaths.add(path))
+    audioCache.set(path, audio)
+  }
+  return audio
+}
+
+/** Web Audio API oscillator — fallback beep when sound files are missing */
+let _fallbackCtx: AudioContext | null = null
+function getFallbackCtx(): AudioContext | null {
+  if (_fallbackCtx && _fallbackCtx.state !== 'closed') return _fallbackCtx
+  try {
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    if (!AC) return null
+    _fallbackCtx = new AC()
+    return _fallbackCtx
+  } catch { return null }
+}
+
+function playFallbackBeep(volume: number) {
+  const ctx = getFallbackCtx()
+  if (!ctx) return
+  try {
+    if (ctx.state === 'suspended') ctx.resume()
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    osc.frequency.value = 800
+    gain.gain.value = volume * 0.3
+    osc.start()
+    osc.stop(ctx.currentTime + 0.15)
+  } catch { /* AudioContext unavailable */ }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORE — audio settings + playback
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STORAGE_KEY = 'oasis-audio-settings'
+
+interface AudioManagerState {
+  /** Master volume 0-1 */
+  volume: number
+  /** Mute all sounds */
+  muted: boolean
+  /** Per-event sound selection (sound option ID) */
+  selections: Record<SoundEvent, string>
+
+  /** Play a sound event */
+  play: (event: SoundEvent) => void
+  /** Play a random footstep (for continuous walking) */
+  playFootstep: () => void
+  /** Play an arbitrary audio file by URL (for per-spell sound overrides) */
+  playUrl: (url: string, volumeMultiplier?: number) => void
+  /** Set volume */
+  setVolume: (v: number) => void
+  /** Toggle mute */
+  toggleMute: () => void
+  /** Change the selected sound for an event */
+  selectSound: (event: SoundEvent, optionId: string) => void
+  /** Preview a specific sound option */
+  preview: (event: SoundEvent, optionId: string) => void
+}
+
+function loadSettings(): { volume: number; muted: boolean; selections: Record<SoundEvent, string> } {
+  if (typeof window === 'undefined') return createDefaultAudioSettings()
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (saved) {
+      const parsed = JSON.parse(saved)
+      const selections = { ...DEFAULT_SELECTIONS, ...parsed.selections }
+      if (
+        typeof selections.buttonClick === 'string' &&
+        (selections.buttonClick.startsWith('switch') || selections.buttonClick.startsWith('soft') || selections.buttonClick.startsWith('menuOpen'))
+      ) {
+        selections.buttonClick = DEFAULT_SELECTIONS.buttonClick
+      }
+      if (
+        typeof selections.buttonHover === 'string' &&
+        (selections.buttonHover.startsWith('roll') || selections.buttonHover.startsWith('soft') || selections.buttonHover.startsWith('hoverSwoosh') || selections.buttonHover.startsWith('hoverScroll'))
+      ) {
+        selections.buttonHover = DEFAULT_SELECTIONS.buttonHover
+      }
+      return {
+        volume: parsed.volume ?? DEFAULT_VOLUME,
+        muted: parsed.muted ?? DEFAULT_MUTED,
+        selections,
+      }
+    }
+  } catch {}
+  return createDefaultAudioSettings()
+}
+
+function saveSettings(state: { volume: number; muted: boolean; selections: Record<SoundEvent, string> }) {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      volume: state.volume,
+      muted: state.muted,
+      selections: state.selections,
+    }))
+  } catch {}
+}
+
+// Footstep alternation — cycle through available footstep sounds
+let footstepIndex = 0
+
+/**
+ * The Oasis has one sound set for every menu, panel and button (src/lib/ui-sounds.ts). Code that asks this
+ * manager for a button hover or click is answered by that set, so old and new buttons sound alike. The router
+ * returns false to let the sample chosen in Settings > Sound play instead (the "Classic" set).
+ */
+let uiSoundRouter: ((event: 'buttonHover' | 'buttonClick') => boolean) | null = null
+export function setUiSoundRouter(router: ((event: 'buttonHover' | 'buttonClick') => boolean) | null): void {
+  uiSoundRouter = router
+}
+
+export const useAudioManager = create<AudioManagerState>((set, get) => {
+  const initial = loadSettings()
+
+  return {
+    ...initial,
+
+    play: (event) => {
+      const { muted, volume, selections } = get()
+      if (muted || volume === 0) return
+      if (uiSoundRouter && (event === 'buttonHover' || event === 'buttonClick') && uiSoundRouter(event)) return
+      if (shouldSkipForCooldown(event)) return
+
+      const optionId = selections[event]
+      const options = SOUND_OPTIONS[event]
+      const option = options.find(o => o.id === optionId) || options[0]
+      if (!option) return
+      const effectiveVolume = volume * getSoundVolumeMultiplier(event)
+
+      // If this sound file is known-broken, use oscillator fallback immediately
+      if (brokenPaths.has(option.path)) {
+        playFallbackBeep(effectiveVolume)
+        return
+      }
+
+      const audio = getAudio(option.path)
+      if (isEventStillAudible(event, audio)) return
+      audio.volume = effectiveVolume
+      audio.currentTime = 0
+      audio.play().catch(() => {
+        // File load error -> oscillator fallback (autoplay block -> silent, that's fine)
+        if (audio.error) {
+          brokenPaths.add(option.path)
+          playFallbackBeep(effectiveVolume)
+        }
+      })
+    },
+
+    playUrl: (url, volumeMultiplier = 1) => {
+      const { muted, volume } = get()
+      if (muted || volume === 0 || !url) return
+      const effectiveVolume = volume * volumeMultiplier
+      if (brokenPaths.has(url)) { playFallbackBeep(effectiveVolume); return }
+      const audio = getAudio(url)
+      audio.volume = effectiveVolume
+      audio.currentTime = 0
+      audio.play().catch(() => {
+        if (audio.error) { brokenPaths.add(url); playFallbackBeep(effectiveVolume) }
+      })
+    },
+
+    playFootstep: () => {
+      const { muted, volume } = get()
+      if (muted || volume === 0) return
+
+      // Cycle through ALL footstep sounds for variety (ignores dropdown — footsteps need variety)
+      const steps = SOUND_OPTIONS.footstep
+      const step = steps[footstepIndex % steps.length]
+      footstepIndex++
+
+      if (brokenPaths.has(step.path)) { playFallbackBeep(volume * 0.15); return }
+      const audio = getAudio(step.path)
+      audio.volume = volume * 0.15  // footsteps much quieter than UI sounds
+      audio.currentTime = 0
+      audio.play().catch(() => {
+        if (audio.error) { brokenPaths.add(step.path); playFallbackBeep(volume * 0.15) }
+      })
+    },
+
+    setVolume: (v) => {
+      set({ volume: Math.max(0, Math.min(1, v)) })
+      saveSettings(get())
+    },
+
+    toggleMute: () => {
+      set(s => ({ muted: !s.muted }))
+      saveSettings(get())
+    },
+
+    selectSound: (event, optionId) => {
+      set(s => ({
+        selections: { ...s.selections, [event]: optionId }
+      }))
+      saveSettings(get())
+    },
+
+    preview: (event, optionId) => {
+      const options = SOUND_OPTIONS[event]
+      const option = options.find(o => o.id === optionId)
+      if (!option) return
+      if (brokenPaths.has(option.path)) { playFallbackBeep(get().volume); return }
+      const audio = getAudio(option.path)
+      audio.volume = get().volume
+      audio.currentTime = 0
+      audio.play().catch(() => {
+        if (audio.error) { brokenPaths.add(option.path); playFallbackBeep(get().volume) }
+      })
+    },
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EVENTBUS SUBSCRIBER — auto-play sounds when commands dispatch
+// ═══════════════════════════════════════════════════════════════════════════
+
+const COMMAND_TO_SOUND: Partial<Record<OasisCommand['type'], SoundEvent>> = {
+  SELECT_OBJECT: 'select',
+  DELETE_OBJECT: 'delete',
+  FOCUS_AGENT_WINDOW: 'agentFocus',
+  UNFOCUS_AGENT_WINDOW: 'agentUnfocus',
+  UNDO: 'undo',
+  REDO: 'redo',
+  ENTER_PLACEMENT: 'conjureStart',
+  CANCEL_PLACEMENT: 'deselect',
+  SAVE_WORLD: undefined,  // too frequent, skip
+  SPAWN_VFX: 'place',
+}
+
+let audioSubscribed = false
+
+export function registerAudioSubscriber(): () => void {
+  if (audioSubscribed) return () => {}
+  audioSubscribed = true
+
+  const unsub = eventBus.subscribe((cmd) => {
+    // Special: SELECT_OBJECT plays 'select' or 'deselect' based on payload
+    if (cmd.type === 'SELECT_OBJECT') {
+      useAudioManager.getState().play(cmd.payload.id ? 'select' : 'deselect')
+      return
+    }
+
+    const soundEvent = COMMAND_TO_SOUND[cmd.type]
+    if (soundEvent) {
+      useAudioManager.getState().play(soundEvent)
+    }
+  })
+
+  return () => {
+    unsub()
+    audioSubscribed = false
+  }
+}

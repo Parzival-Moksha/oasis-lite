@@ -1,0 +1,12 @@
+{
+  "seedVersion": 1,
+  "worlds": [
+    {
+      "slug": "oasis-dusk",
+      "id": "world-1794211873285-r54v",
+      "file": "oasis-dusk.world.json",
+      "name": "Oasis Dusk",
+      "visibility": "private"
+    }
+  ]
+}

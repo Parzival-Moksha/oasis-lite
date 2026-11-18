@@ -1,0 +1,502 @@
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// OASIS DATABASE SCHEMA — SQLite local-first
+// The single source of truth for missions, memory, and agent state
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../node_modules/.prisma/client"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MISSION — The atomic unit of work
+// SCORE = (actualSeconds / 60) × VALOR × PRIORITY
+// PRIORITY = (urgency × easiness × impact) / 125
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Mission {
+  id             Int       @id @default(autoincrement())
+  name           String
+  description    String?
+  status         String    @default("todo") // todo | wip | done | archived
+  queuePosition  Int?      // null = unqueued, 1-based for active queue
+
+  // Priority Triangle
+  urgency        Float     @default(5) // 1-10
+  easiness       Float     @default(5) // 1-10
+  impact         Float     @default(5) // 1-10
+  priority       Float     @default(1) // (U×E×I)/125
+
+  // Scoring
+  valor          Float?    // 0.0-2.0 self-assessment of focus/quality
+  score          Float?    // final: (mins × valor × priority)
+
+  // Time Tracking
+  startedAt      DateTime?
+  endedAt        DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  horizon        String?   // 'fixed' | 'open' | null
+  targetSeconds  Int?      // budget for fixed horizon
+  isPaused       Boolean   @default(false)
+  pausedAt       DateTime?
+  totalPausedMs  Int       @default(0)
+  actualSeconds  Int?      // real work time
+  isIRL          Boolean   @default(false) // offline/physical work
+
+  // Maturation (curator pipeline)
+  // 0=para 1=pashyanti 2=madhyama 3=vaikhari 4=built 5=reviewed 6=tested 7=gamertested 8=carbontested
+  maturityLevel  Int       @default(0)
+  assignedTo     String?   // 'carbondev' | 'anorak' | 'parzival' | null
+  executionMode  String?   // 'crispr' (worktree) | 'builder' (direct) — set by curator
+
+  // Specs (curator-enriched)
+  carbonDescription   String? // human-language war cry (vibes, emotions, analogies)
+  siliconDescription  String? // technical spec for coder (the bible)
+  acceptanceCriteria  String? // what "done" means (baked into siliconDescription too)
+
+  // Curator scoring (RL signal)
+  flawlessPercent     Float?  // 0-100 curator's execution confidence
+  reviewerScore       Float?  // 0-100 first-pass reviewer score
+  testerScore         Float?  // 0-100 first-pass tester score
+  gamerScore          Float?  // 0-100 first-pass gamer score
+  gamerVerdict        String? // 'PASS' | 'FAIL' | 'BLOCKED'
+
+  // Curator queue (separate from devcraft queue)
+  curatorQueuePosition Int?   // null = not in curator queue
+
+  // Execution checkpoint (DB recovery after crash)
+  executionPhase      String? // 'coding' | 'reviewing' | 'testing' | null
+  executionRound      Int     @default(0) // which coder→reviewer round
+
+  // History Thread — JSON array of HistoryEntry objects
+  // { timestamp, actor, action, curatorMsg?, silicondevMsg?, verdict?, rating?, ... }
+  history        String?   // full lifecycle log (curator, carbondev, coder, reviewer, tester)
+  notes          String?   // legacy / free-text notes
+
+  // Mission image (curator-generated battle flag)
+  imageUrl       String?   // URL or path to generated mission image
+
+  // Dharma (Noble Eightfold Path of the Oasis)
+  dharmaPath     String?   // comma-separated: view,intention,speech,action,livelihood,effort,mindfulness,concentration
+  questName      String?   // parent quest/yatra name
+
+  @@index([status])
+  @@index([queuePosition])
+  @@index([maturityLevel])
+  @@index([assignedTo])
+  @@index([curatorQueuePosition])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY — Structured key-value knowledge persistence
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Memory {
+  id        Int      @id @default(autoincrement())
+  category  String   // preference | habit | goal | fact | pattern
+  key       String
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([category, key])
+  @@index([category])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORLD — 3D world with full state as JSON
+// ═══════════════════════════════════════════════════════════════════════════
+
+model World {
+  id              String    @id @default(cuid())
+  shortCode       String?   @unique
+  userId          String    @default("local-user")
+  name            String    @default("The Forge")
+  icon            String    @default("🌍")
+  visibility      String    @default("private") // private | public | unlisted | public_edit
+  /** Asset-tier visibility for user-scope assets PLACED inside this world.
+   *  'public' = anyone visiting sees the owner's user-scope assets.
+   *  'private' = only the world owner sees user-scope assets (others fall back). */
+  assetVisibility String    @default("public") // public | private
+  /** PvP toggle. Defaults false; auto-opts-in when visibility flips to
+   *  'public_edit' (sandbox) unless the owner has previously toggled it.
+   *  Mirrored into the Colyseus room at join time. */
+  pvpEnabled      Boolean   @default(false)
+
+  data            String?   // JSON: full WorldState (catalog objects, crafted scenes, conjured assets, sky, ground)
+  creatorName     String?
+  creatorAvatar   String?
+
+  visitCount      Int       @default(0)
+  likeCount       Int       @default(0)
+  objectCount     Int       @default(0)
+  thumbnailUrl    String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  snapshots       WorldSnapshot[]
+  likes           WorldLike[]
+  events          WorldEvent[]
+
+  @@index([userId])
+  @@index([visibility])
+}
+
+model WorldLike {
+  id        Int      @id @default(autoincrement())
+  worldId   String
+  userId    String
+  createdAt DateTime @default(now())
+
+  world     World    @relation(fields: [worldId], references: [id], onDelete: Cascade)
+
+  @@unique([worldId, userId])
+  @@index([worldId, createdAt])
+  @@index([userId, createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASSET — unified registry for every loadable thing in the Oasis
+// ─═̷─═̷─ॐ─═̷─═̷─ Replaces the four hardcoded TS arrays over time ─═̷─═̷─ॐ─═̷─═̷─
+//
+// Tiered by `scope`:
+//   'core'   — ships with the repo, visible to everyone. Source of truth is
+//              JSON / TS constants until v1 migrates them in. This table
+//              is allowed to mirror them but doesn't have to.
+//   'shared' — uploaded post-deploy by an admin, visible to all users of
+//              this instance. Reserved; populates after auth lands.
+//   'user'   — owned by a single user, visible only to them (and to other
+//              visitors when their world has assetVisibility='public').
+//
+// `kind` discriminates the schema's optional fields:
+//   'glb' | 'gltf' | 'vrm' | 'sound' | 'ground' | 'sky' | 'conjured' | 'crafted'
+//
+// v0 is plumbing — the table exists, the API uses it, but existing
+// constants.ts arrays and conjured/crafted registries are NOT migrated yet.
+// v1 will do that migration + retire the legacy storage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Asset {
+  id            String    @id @default(cuid())
+  /** Discriminator: glb | gltf | vrm | sound | ground | sky | conjured | crafted */
+  kind          String
+  /** Public-served path (e.g. /models/foo/bar.glb) or storage URL. */
+  path          String
+  /** Optional bucket for filtering in the Wizard Console catalog. */
+  category      String?
+  /** Display name (human-readable). */
+  name          String
+  /** Short 1-4 word label for agent picking (often vision-captioned). */
+  shortLabel    String?
+  /** One-sentence description for agent picking. */
+  description   String?
+  /** Default scale multiplier when placed. */
+  defaultScale  Float     @default(1)
+  /** JSON [w, h, d] in meters, at defaultScale. */
+  bbox          String?
+  /** Thumbnail URL (auto-generated by useCatalogThumbnailGenerator). */
+  thumbnailUrl  String?
+  /** File size in bytes (for repo-bloat accounting). */
+  bytes         Int?
+  /** Asset tier: 'core' | 'shared' | 'user'. */
+  scope         String    @default("user")
+  /** Owner user id (null for core/shared). Foreign key once auth lands. */
+  ownerId       String?
+  /** Origin pack / generator: Kenney, Quaternius, Hunyuan, Meshy, crafted, ... */
+  source        String?
+  /** License string (CC0, CC-BY, internal, ...). */
+  license       String?
+  /** JSON string[] of free-form tags. */
+  tags          String?
+  /** Kind-specific JSON blob. For `crafted` this stores the full CraftedScene
+   *  (id, name, prompt, objects[], position, createdAt, model). For other
+   *  kinds this is null. Lets us retire scene-library.json reads. */
+  data          String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([scope, ownerId])
+  @@index([kind, category])
+  @@index([ownerId, kind])
+}
+
+model WorldSnapshot {
+  id              String    @id @default(cuid())
+  worldId         String
+  world           World     @relation(fields: [worldId], references: [id], onDelete: Cascade)
+
+  data            String?   // JSON: full WorldState
+  objectCount     Int       @default(0)
+  source          String    @default("auto") // auto | manual
+
+  createdAt       DateTime  @default(now())
+
+  @@index([worldId, createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JOURNAL — Sacred timestamped reflections
+// ═══════════════════════════════════════════════════════════════════════════
+
+// WORLD EVENT LOG - accepted durable command trail
+model WorldEvent {
+  id           String   @id
+  worldId      String
+  world        World    @relation(fields: [worldId], references: [id], onDelete: Cascade)
+  commandId    String
+  actorId      String
+  sessionId    String   @default("")
+  kind         String
+  worldVersion Int
+  payload      String
+  payloadHash  String?
+  createdAt    DateTime @default(now())
+
+  @@index([worldId, worldVersion])
+  @@index([worldId, createdAt])
+  @@unique([worldId, commandId])
+  @@index([commandId])
+  @@index([actorId, createdAt])
+}
+
+// JOURNAL - Sacred timestamped reflections
+model Journal {
+  id        Int      @id @default(autoincrement())
+  content   String
+  tags      String?  // JSON: string[]
+  mood      String?
+  createdAt DateTime @default(now())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APP CONFIG — Key-value store for dynamic settings (XP awards, etc.)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model AppConfig {
+  key       String   @id
+  value     String   // JSON string
+  updatedAt DateTime @default(now())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CURATOR LOG — Per-invocation tracking for Anorak Pro's curator
+// "The garden tender's journal"
+// ═══════════════════════════════════════════════════════════════════════════
+
+model CuratorLog {
+  id                Int       @id @default(autoincrement())
+  status            String    @default("running") // running, completed, failed
+
+  startedAt         DateTime  @default(now())
+  endedAt           DateTime?
+  durationMs        Int?
+
+  // Cost
+  tokensIn          Int       @default(0)
+  tokensOut         Int       @default(0)
+
+  // Results
+  missionsProcessed Int       @default(0)
+  missionsEnriched  Int       @default(0)
+  missionResults    String?   // JSON: per-mission enrichment results
+
+  // Error
+  error             String?
+
+  @@index([status])
+  @@index([startedAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CARBON MODEL — Training pairs for Player 1 prediction
+// ═══════════════════════════════════════════════════════════════════════════
+
+model CarbonModelEntry {
+  id                Int      @id @default(autoincrement())
+  missionId         Int?
+  missionName       String?
+  context           String   // what prompted this prediction
+  predictedResponse String   // what the model thought Player 1 would say
+  actualResponse    String?  // what Player 1 actually said (null = pending)
+  accepted          Boolean?
+  rating            Int?     // 0-10
+  confidence        Float?   // 0.0-1.0
+  decision          String?  // bump | refine | other
+  createdAt         DateTime @default(now())
+
+  @@index([missionId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROFILE — Local-first user profile (single row per userId)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Profile {
+  id            Int      @id @default(autoincrement())
+  userId        String   @unique @default("local-user")
+  displayName   String   @default("Player 1")
+  bio           String?
+  avatarUrl     String?
+  avatar3dUrl   String?
+  totalXp       Int      @default(0)
+  level         Int      @default(1)
+  aura          Int      @default(0)
+  hp            Int      @default(100)
+  mana          Int      @default(20)
+  unspentSkillPoints Int @default(0)
+  skillFire     Int      @default(0)
+  skillIce      Int      @default(0)
+  skillLightning Int    @default(0)
+  skillVitality Int      @default(0)
+  skillFocus    Int      @default(0)
+  skillConjuration Int  @default(0)
+  skillMobility Int      @default(0)
+  lastLoginDate String?  // ISO date string 'YYYY-MM-DD'
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// Player progression: durable spell, quest, achievement, and NPC memory state.
+model PlayerSpellUnlock {
+  id            Int      @id @default(autoincrement())
+  userId        String
+  spellId       String
+  level         Int      @default(1)
+  sourceQuestId String?
+  uses          Int      @default(0)
+  metadata      String   @default("{}")
+  unlockedAt    DateTime @default(now())
+  lastUsedAt    DateTime?
+
+  @@unique([userId, spellId])
+  @@index([spellId])
+  @@index([userId, unlockedAt])
+}
+
+model PlayerQuestProgress {
+  id             Int      @id @default(autoincrement())
+  userId         String
+  questId        String
+  status         String   @default("active")
+  currentStepId  String?
+  completedSteps String   @default("[]")
+  metadata       String   @default("{}")
+  startedAt      DateTime @default(now())
+  completedAt    DateTime?
+  updatedAt      DateTime @updatedAt
+
+  @@unique([userId, questId])
+  @@index([questId, status])
+  @@index([userId, updatedAt])
+}
+
+model PlayerAchievement {
+  id            Int      @id @default(autoincrement())
+  userId        String
+  achievementId String
+  source        String?
+  quote         String?
+  metadata      String   @default("{}")
+  unlockedAt    DateTime @default(now())
+
+  @@unique([userId, achievementId])
+  @@index([achievementId])
+  @@index([userId, unlockedAt])
+}
+
+model NpcMemory {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  npcId     String
+  summary   String   @default("")
+  metadata  String   @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, npcId])
+  @@index([npcId])
+  @@index([userId, updatedAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOKEN BURN — Per-source aggregated token usage tracking
+// Aggregated by source + time window (hourly buckets)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model TokenBurn {
+  id                Int      @id @default(autoincrement())
+  userId            String   @default("local-user")
+  source            String   // 'anorak' | 'anorak-pro-chat' | 'anorak-pro-curator' | etc.
+  provider          String   @default("unknown")
+  model             String   @default("unknown")
+  sessionId         String   @default("")
+  inputTokens       Int      @default(0)
+  cachedInputTokens Int      @default(0)
+  outputTokens      Int      @default(0)
+  costUsd           Float?
+  window            String   // ISO hour bucket: '2026-03-28T14' (query helper)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([source, createdAt])
+  @@index([provider, createdAt])
+  @@index([sessionId])
+  @@index([window])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AGENT SESSION CACHE — durable local-first panel/session state
+// ═══════════════════════════════════════════════════════════════════════════
+
+// OASIS ANALYTICS EVENT - Early product/game KPI event stream
+// Keep this broad while the magic moment is still being discovered.
+model OasisAnalyticsEvent {
+  id         Int      @id @default(autoincrement())
+  sessionId String   @default("")
+  userId    String   @default("hosted-anonymous")
+  eventType String
+  worldId   String?
+  agentType String?
+  source    String?
+  durationMs Int?
+  costUsd   Float?
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([eventType, createdAt])
+  @@index([sessionId, createdAt])
+  @@index([userId, createdAt])
+  @@index([worldId, createdAt])
+  @@index([agentType, createdAt])
+}
+
+model AgentSessionCache {
+  id            String   @id // cache key: agentType:sessionId
+  sessionId     String
+  userId        String   @default("local-user")
+  agentType     String
+  title         String?
+  model         String?
+  payload       String   // JSON: agent-specific messages/session state
+  messageCount  Int      @default(0)
+  source        String   @default("oasis")
+  lastActiveAt  DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([userId, agentType, sessionId])
+  @@index([userId, agentType, updatedAt])
+  @@index([agentType, lastActiveAt])
+  @@index([sessionId])
+}

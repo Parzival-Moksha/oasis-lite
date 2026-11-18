@@ -1,0 +1,425 @@
+'use client'
+
+import { useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { useUILayer } from '@/lib/input-manager'
+import { useAudioManager } from '@/lib/audio-manager'
+import { useOasisStore } from '@/store/oasisStore'
+import { useRailMenuExclusion } from '@/hooks/useRailMenuExclusion'
+import { SettingsContext } from '@/components/scene-lib/contexts'
+import { resolveFontFamily } from '@/lib/fonts'
+import {
+  SPELLBOOK_PAGE_IDS,
+  SPELLBOOK_PAGES,
+  SPELL_DEFS,
+  SPELL_IDS,
+  isSpellId,
+  type SpellDefinition,
+  type SpellId,
+  type SpellbookPageId,
+} from '@/lib/spellbook'
+
+type SpellbookOpenDetail = {
+  spellId?: string
+}
+
+type PlayerSpellbookPanelProps = {
+  visible: boolean
+  isOpen: boolean
+  onOpenChange: (open: boolean) => void
+  onCastSpell?: (spellId: SpellId) => void
+  /** When true, every non-combat spell shows a 🔒 overlay. The card stays
+   *  clickable — the cast handler shows a notice — so players can read
+   *  the rule, not just see a dead tile. */
+  readOnly?: boolean
+  lockedSpellIds?: readonly SpellId[]
+  /** The Wizard console exists for this visitor: show the button that opens it. */
+  canOpenWizard?: boolean
+}
+
+const COMBAT_SPELL_IDS = new Set<SpellId>(['firebolt', 'lightning-bolt', 'ice-bolt', 'machine-gun'])
+function isCombatSpell(spellId: SpellId): boolean {
+  return COMBAT_SPELL_IDS.has(spellId)
+}
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  if (!el) return false
+  const tag = el.tagName
+  if (tag === 'INPUT') {
+    const type = (el as HTMLInputElement).type
+    return !['range', 'color', 'checkbox', 'radio', 'file', 'button', 'image', 'reset', 'submit'].includes(type)
+  }
+  return tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable
+}
+
+function spellTileSrc(spellId: SpellId): string {
+  return `/ui/spellbook/tiles/${spellId}.gpt2.webp`
+}
+
+export function PlayerSpellbookPanel({
+  visible,
+  isOpen,
+  onOpenChange,
+  onCastSpell,
+  readOnly = false,
+  lockedSpellIds = [],
+  canOpenWizard = false,
+}: PlayerSpellbookPanelProps) {
+  const [activePage, setActivePage] = useState<SpellbookPageId>('recipe-catalog')
+  const [highlightSpellId, setHighlightSpellId] = useState<SpellId | null>(null)
+  const selectedSpellId = useOasisStore(s => s.selectedSpellId)
+  const { settings } = useContext(SettingsContext)
+  const spellbookFont = resolveFontFamily(settings.uiFont)
+  useUILayer('spellbook-menu', Boolean(visible && isOpen))
+  // Rail-menu mutual exclusion: opening any other rail menu (CONFIG/AGENTS/etc)
+  // closes the spellbook; opening the spellbook closes them.
+  const closeSpellbook = useCallback(() => onOpenChange(false), [onOpenChange])
+  useRailMenuExclusion('spellbook', isOpen, closeSpellbook)
+
+  const playMenuHover = useCallback(() => {
+    useAudioManager.getState().play('buttonHover')
+  }, [])
+
+  const handlePageClick = useCallback((pageId: SpellbookPageId) => {
+    useAudioManager.getState().play('buttonClick')
+    setActivePage(pageId)
+  }, [])
+
+  const handleCardClick = useCallback((spellId: SpellId) => {
+    useAudioManager.getState().play('buttonClick')
+    onCastSpell?.(spellId)
+  }, [onCastSpell])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onOpen = (event: Event) => {
+      const detail = (event as CustomEvent<SpellbookOpenDetail>).detail
+      if (detail?.spellId && isSpellId(detail.spellId)) {
+        setActivePage(SPELL_DEFS[detail.spellId].category)
+        setHighlightSpellId(detail.spellId)
+        window.setTimeout(() => setHighlightSpellId(null), 2600)
+      }
+      onOpenChange(true)
+    }
+    window.addEventListener('oasis:spellbook-open', onOpen)
+    return () => {
+      window.removeEventListener('oasis:spellbook-open', onOpen)
+    }
+  }, [onOpenChange])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!visible || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return
+      if (event.code !== 'KeyB') return
+      if (isTypingTarget(event.target)) return
+      event.preventDefault()
+      onOpenChange(!isOpen)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isOpen, onOpenChange, visible])
+
+  const spellsByPage = useMemo(() => {
+    const map = new Map<SpellbookPageId, SpellDefinition[]>()
+    for (const spellId of SPELL_IDS) {
+      const definition = SPELL_DEFS[spellId]
+      const pageSpells = map.get(definition.category) || []
+      pageSpells.push(definition)
+      map.set(definition.category, pageSpells)
+    }
+    return map
+  }, [])
+
+  if (!visible || !isOpen) return null
+
+  const activeSpells = spellsByPage.get(activePage) || []
+
+  return (
+    <div
+      data-ui-panel
+      data-spellbook-menu-panel
+      className="fixed left-[10.25rem] top-4 z-[285] w-[min(760px,calc(100vw-11.5rem))] max-h-[calc(100vh-2rem)] overflow-hidden rounded-lg border border-amber-200/28 bg-[#050403]/82 text-white shadow-[0_0_70px_rgba(251,146,60,0.24),0_0_28px_rgba(0,0,0,0.78)] max-[700px]:bottom-[170px] max-[700px]:left-2 max-[700px]:right-2 max-[700px]:top-[58px] max-[700px]:w-auto max-[700px]:max-h-none"
+      style={{ fontFamily: spellbookFont }}
+      onMouseDown={event => event.stopPropagation()}
+    >
+      <style>{`
+        @keyframes oasisSpellLearnedPulse {
+          0%, 100% { box-shadow: 0 0 24px rgba(251,146,60,0.26); transform: translateY(0); }
+          35% { box-shadow: 0 0 58px rgba(251,191,36,0.72); transform: translateY(-2px); }
+        }
+        @keyframes oasisSpellSelectPulse {
+          0% { box-shadow: 0 0 0 rgba(251,191,36,0.0); }
+          50% { box-shadow: 0 0 38px rgba(251,191,36,0.65); }
+          100% { box-shadow: 0 0 18px rgba(251,191,36,0.32); }
+        }
+        @keyframes oasisChapterShimmer {
+          0% { transform: translateX(-125%) skewX(-18deg); opacity: 0; }
+          18% { opacity: 0.95; }
+          100% { transform: translateX(132%) skewX(-18deg); opacity: 0; }
+        }
+        @keyframes oasisChapterRune {
+          0% { opacity: 0; transform: translate(-50%, -50%) scale(0.35) rotate(0deg); }
+          42% { opacity: 0.95; transform: translate(-50%, -50%) scale(1.16) rotate(64deg); }
+          100% { opacity: 0; transform: translate(-50%, -50%) scale(1.82) rotate(112deg); }
+        }
+        @keyframes oasisChapterSelectedPulse {
+          0%, 100% { opacity: 0.52; transform: scaleX(0.72); }
+          50% { opacity: 1; transform: scaleX(1); }
+        }
+        .oasis-spellbook-chapter {
+          position: relative;
+          isolation: isolate;
+          transform: translateZ(0);
+          transition: border-color 180ms ease, color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease, filter 180ms ease;
+        }
+        .oasis-spellbook-chapter::before {
+          content: '';
+          position: absolute;
+          inset: -1px;
+          z-index: -1;
+          opacity: 0;
+          border-radius: inherit;
+          background:
+            radial-gradient(circle at 18% 10%, rgba(255,255,255,0.45), transparent 22%),
+            radial-gradient(circle at 82% 82%, rgba(45,212,191,0.34), transparent 24%),
+            linear-gradient(135deg, rgba(251,191,36,0.24), rgba(236,72,153,0.15) 46%, rgba(14,165,233,0.18));
+          transition: opacity 180ms ease;
+        }
+        .oasis-spellbook-chapter::after {
+          content: '';
+          position: absolute;
+          inset: -35% -55%;
+          z-index: 1;
+          pointer-events: none;
+          opacity: 0;
+          background: linear-gradient(90deg, transparent, rgba(255,255,255,0.58), rgba(251,191,36,0.5), transparent);
+          mix-blend-mode: screen;
+        }
+        .oasis-spellbook-chapter:hover {
+          transform: translateY(-1px) scale(1.035);
+          filter: saturate(1.14);
+        }
+        .oasis-spellbook-chapter:hover::before {
+          opacity: 1;
+        }
+        .oasis-spellbook-chapter:hover::after {
+          animation: oasisChapterShimmer 760ms cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .oasis-spellbook-chapter:active {
+          transform: translateY(1px) scale(0.972);
+        }
+        .oasis-spellbook-chapter[data-selected="true"] {
+          border-color: rgba(251,191,36,0.78);
+          box-shadow: 0 0 0 1px rgba(251,191,36,0.18), 0 0 26px rgba(251,191,36,0.28), inset 0 0 20px rgba(251,191,36,0.08);
+        }
+        .oasis-spellbook-chapter[data-selected="true"]::before {
+          opacity: 0.82;
+        }
+        .oasis-chapter-rune {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          z-index: 2;
+          width: 2.25rem;
+          height: 2.25rem;
+          pointer-events: none;
+          opacity: 0;
+          border-radius: 999px;
+          border: 1px solid rgba(255,255,255,0.65);
+          box-shadow: 0 0 18px rgba(251,191,36,0.66), inset 0 0 14px rgba(14,165,233,0.26);
+        }
+        .oasis-chapter-rune::before,
+        .oasis-chapter-rune::after {
+          content: '';
+          position: absolute;
+          inset: 50% auto auto 50%;
+          width: 1.45rem;
+          height: 1px;
+          background: rgba(255,255,255,0.8);
+          transform-origin: center;
+        }
+        .oasis-chapter-rune::before { transform: translate(-50%, -50%) rotate(45deg); }
+        .oasis-chapter-rune::after { transform: translate(-50%, -50%) rotate(-45deg); }
+        .oasis-spellbook-chapter:active .oasis-chapter-rune {
+          animation: oasisChapterRune 420ms cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .oasis-chapter-bar {
+          transform-origin: center;
+        }
+        .oasis-spellbook-chapter:hover .oasis-chapter-bar {
+          opacity: 0.82;
+          transform: scaleX(1);
+        }
+        .oasis-spellbook-chapter[data-selected="true"] .oasis-chapter-bar {
+          animation: oasisChapterSelectedPulse 1500ms ease-in-out infinite;
+        }
+      `}</style>
+      <div
+        className="pointer-events-none absolute inset-0 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: `url(/ui/spellbook/frame/page-bg-${activePage}.jpg)` }}
+      />
+      <div className="pointer-events-none absolute inset-0 bg-black/50" />
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/16 via-transparent to-black/24" />
+      <div
+        className="relative flex items-center justify-between gap-3 border-b border-amber-100/14 bg-black/18 px-4 py-3"
+        style={{
+          // ─═̷─ Match the page texture so the header doesn't look like
+          // dead chrome above a richly textured page. Same bg as the
+          // content scroll area below. ─═̷─
+          backgroundImage: 'none',
+          backgroundSize: 'auto',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
+        }}
+      >
+        <div className="pointer-events-none absolute inset-0 bg-black/0" />
+        <div className="relative min-w-0">
+          <div className="text-[10px] font-black uppercase tracking-[0.24em] text-white/75">Spells</div>
+          <div className="mt-1 truncate text-lg font-black tracking-[0.02em] text-white">Spellbook</div>
+        </div>
+        {/* ─═̷─ Demo: red ornate plate from the GPT-image-2 atlas. Background
+            stretches across the whole button (caps + middle in one png).
+            Tweak texture/sizing here; rest of the app's pattern is the
+            same — `style={{ backgroundImage: ... }}` + size to fit. ─═̷─ */}
+        {/* The Wizard console left the rail (2026-11-16): it opens from here. */}
+        {canOpenWizard && (<button
+          type="button"
+          data-spellbook-action="wizard-console"
+          title="The Wizard console: conjure, craft and the asset library"
+          className="relative ml-auto mr-2 h-10 rounded-md border border-orange-300/40 bg-black/40 px-3 text-[11px] font-black uppercase tracking-[0.16em] text-orange-100 transition hover:border-orange-200/80 hover:bg-orange-300/15"
+          onPointerEnter={playMenuHover}
+          onClick={() => {
+            useAudioManager.getState().play('buttonClick')
+            onOpenChange(false)
+            window.dispatchEvent(new CustomEvent('oasis:open-wizard'))
+          }}
+        >
+          Wizard
+        </button>)}
+        <button
+          type="button"
+          className="relative h-10 min-w-24 bg-no-repeat px-4 text-[11px] font-black uppercase tracking-[0.16em] text-amber-50 transition hover:brightness-110 active:brightness-95"
+          style={{
+            backgroundImage: 'url(/ui/textures-extracted/buttons-red/red-4-rect-lg.png)',
+            backgroundSize: '100% 100%',
+          }}
+          onPointerEnter={playMenuHover}
+          onClick={() => onOpenChange(false)}
+        >
+          Close
+        </button>
+      </div>
+
+      <div
+        className="relative flex gap-1 overflow-x-auto border-b border-white/10 bg-black/22 px-2 py-2"
+        style={{
+          backgroundImage: 'none',
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
+        }}
+      >
+        <div className="pointer-events-none absolute inset-0 bg-black/0" />
+        {SPELLBOOK_PAGE_IDS.map(pageId => {
+          const page = SPELLBOOK_PAGES[pageId]
+          const selected = pageId === activePage
+          return (
+            <button
+              key={pageId}
+              type="button"
+              className={[
+                'oasis-spellbook-chapter shrink-0 overflow-hidden rounded-md border px-2.5 py-2 text-[10px] font-black uppercase tracking-[0.1em]',
+                selected
+                  ? 'border-amber-200/55 bg-amber-200/16 text-white shadow-[0_0_20px_rgba(251,191,36,0.14)]'
+                  : 'border-white/10 bg-black/24 text-white/72 hover:border-white/24 hover:text-white',
+              ].join(' ')}
+              data-selected={selected ? 'true' : 'false'}
+              onPointerEnter={playMenuHover}
+              onClick={() => handlePageClick(pageId)}
+            >
+              <span className="oasis-chapter-rune" />
+              <span className="relative z-[3]">{page.shortName}</span>
+              <span className="oasis-chapter-bar pointer-events-none absolute bottom-1 left-2 right-2 z-[3] h-px origin-center scale-x-0 bg-gradient-to-r from-transparent via-amber-200 to-transparent opacity-0 transition duration-200" />
+            </button>
+          )
+        })}
+      </div>
+
+      <div
+        className="relative max-h-[calc(100vh-11rem)] overflow-y-auto bg-black/8 p-4 max-[700px]:max-h-[calc(100dvh-328px)] max-[700px]:p-2"
+        style={{
+          backgroundImage: 'none',
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
+        }}
+      >
+        <div className="pointer-events-none absolute inset-0 bg-black/0" />
+        <div className="relative mb-3 flex items-center justify-between gap-3">
+          <h3 className="text-[12px] font-black uppercase tracking-[0.18em] text-white/90">
+            {SPELLBOOK_PAGES[activePage].name}
+          </h3>
+          <span className="rounded border border-white/10 bg-white/6 px-2 py-1 font-mono text-[10px] text-white/55">
+            {activeSpells.length}
+          </span>
+        </div>
+
+        <div className="relative grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+          {activeSpells.map(definition => {
+            const highlighted = highlightSpellId === definition.id
+            const selected = selectedSpellId === definition.id
+            const locked = (readOnly && !isCombatSpell(definition.id)) || lockedSpellIds.includes(definition.id)
+            const animation = highlighted
+              ? 'oasisSpellLearnedPulse 1300ms ease-in-out 2'
+              : selected
+                ? 'oasisSpellSelectPulse 520ms ease-out 1'
+                : undefined
+            return (
+              <article
+                key={definition.id}
+                onPointerEnter={playMenuHover}
+                onClick={() => handleCardClick(definition.id)}
+                className={[
+                  'group relative cursor-pointer overflow-hidden rounded-lg border p-2 transition-all duration-200',
+                  'hover:scale-[1.025] hover:border-amber-200/55 hover:shadow-[0_0_22px_rgba(251,191,36,0.32)]',
+                  'active:scale-[0.985]',
+                  selected
+                    ? 'border-amber-200/75 bg-gradient-to-br from-amber-900/42 via-orange-950/62 to-black/92 shadow-[0_0_22px_rgba(251,191,36,0.42)]'
+                    : 'border-orange-200/28 bg-gradient-to-br from-orange-950/44 via-black/60 to-black/88',
+                  locked ? 'opacity-55 grayscale' : '',
+                ].join(' ')}
+                style={animation ? { animation } : undefined}
+              >
+                <div className="mb-2 aspect-[3/4] w-full overflow-hidden rounded-md border border-white/10 bg-gradient-to-b from-black/30 to-black/70">
+                  <img
+                    src={spellTileSrc(definition.id)}
+                    alt={definition.name}
+                    loading="lazy"
+                    className="h-full w-full object-cover opacity-0 transition-all duration-300 group-hover:scale-105"
+                    onLoad={event => { event.currentTarget.style.opacity = '1' }}
+                    onError={event => { event.currentTarget.style.display = 'none' }}
+                  />
+                </div>
+                <div className="text-[12px] font-black leading-tight text-orange-50 sm:text-[13px]">
+                  {definition.name}
+                </div>
+                <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-white/60 sm:text-[11px]">
+                  {definition.summary}
+                </div>
+                {locked && (
+                  <div
+                    className="pointer-events-none absolute right-1.5 top-1.5 rounded-md border border-amber-200/60 bg-black/80 px-1.5 py-1 text-[8px] font-black uppercase tracking-[0.12em] text-amber-100 shadow-[0_0_8px_rgba(0,0,0,0.6)]"
+                    title={definition.lockedSummary || 'Locked'}
+                  >
+                    🔒
+                  </div>
+                )}
+              </article>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}

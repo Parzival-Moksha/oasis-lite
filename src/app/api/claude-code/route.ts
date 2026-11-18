@@ -1,0 +1,736 @@
+export const dynamic = 'force-dynamic'
+
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+// CLAUDE CODE — Full Claude Code session inside the Oasis
+// Full Claude Code session inside the Oasis, multi-turn via --resume.
+// Streams NDJSON events from Claude Code CLI as SSE to the browser.
+// Admin-only. Shakespeare would be proud.
+//
+// Claude Code stream-json format (v2.1.75):
+//   {"type":"system","subtype":"init","session_id":"..."}
+//   {"type":"assistant","message":{"content":[{type:"thinking"},{type:"tool_use"},{type:"text"}]}}
+//   {"type":"user","tool_use_result":{"file":{...}}}  ← tool results
+//   {"type":"result","total_cost_usd":...}
+//
+// Each "assistant" event is a COMPLETE snapshot — content array replaces,
+// not appends. We diff against previous to find new blocks.
+//
+// MCP TOOLS — mission-mcp provides:
+//   Media: generate_image, generate_voice, generate_video
+//   Missions: get_mission, get_missions_queue, create_mission, mature_mission
+//   CI: report_review, report_test
+// ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+import { NextRequest } from 'next/server'
+import { spawn } from 'child_process'
+import path from 'path'
+import fs from 'fs'
+import {
+  normalizeCustomModules,
+  normalizeLobeModules,
+  normalizeModuleValues,
+  normalizeTopMissionCount,
+  renderContextModuleSections,
+  resolveContextModulesForLobe,
+} from '@/lib/anorak-context-modules'
+import { buildClaudeCliEnv } from '@/lib/claude-cli-env'
+import { recordTokenBurn } from '@/lib/token-burn'
+import {
+  extractClaudeTokenUsage,
+  hasTokenUsage,
+  type TokenUsagePayload,
+} from '@/lib/token-usage'
+import { guardAgentRoute } from '@/lib/local-request-guard'
+
+const OASIS_ROOT = process.env.OASIS_ROOT || process.cwd()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MCP CONFIG — mission-mcp has media + mission tools
+// Generated at startup so the claude CLI can --mcp-config it
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MCP_CONFIG_PATH = path.join(OASIS_ROOT, '.claude-code-mcp.json')
+
+function ensureMcpConfig(): string {
+  const config = {
+    mcpServers: {
+      'mission': {
+        command: 'node',
+        args: [path.join(OASIS_ROOT, 'tools/mission-mcp/index.js')],
+        cwd: OASIS_ROOT,
+        env: {
+          OASIS_DB_PATH: path.join(OASIS_ROOT, 'prisma/data/oasis.db'),
+          OASIS_URL: `http://localhost:4516`,
+        },
+      },
+    },
+  }
+  // Write atomically — only if changed
+  const json = JSON.stringify(config, null, 2)
+  try {
+    const existing = fs.readFileSync(MCP_CONFIG_PATH, 'utf-8')
+    if (existing === json) return MCP_CONFIG_PATH
+  } catch { /* file doesn't exist yet */ }
+  fs.writeFileSync(MCP_CONFIG_PATH, json)
+  return MCP_CONFIG_PATH
+}
+
+// Media tool names — when these return results with URLs, we emit 'media' SSE events
+// Claude Code prefixes MCP tools with mcp_{servername}_ so we match both forms
+// Claude Code MCP tool naming: mcp__{servername}__{toolname} (double underscores)
+const MEDIA_TOOL_NAMES = new Set([
+  'generate_image', 'generate_voice', 'generate_video',
+  'mcp_mission_generate_image', 'mcp_mission_generate_voice', 'mcp_mission_generate_video',
+  'mcp__mission__generate_image', 'mcp__mission__generate_voice', 'mcp__mission__generate_video',
+])
+
+function mediaTypeFromTool(name: string): 'image' | 'audio' | 'video' | null {
+  if (name.includes('generate_image')) return 'image'
+  if (name.includes('generate_voice')) return 'audio'
+  if (name.includes('generate_video')) return 'video'
+  return null
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLAUDE CODE SYSTEM PROMPT
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildSystemPreamble(): string {
+  return `You are Claude Code, running inside the Oasis — a 3D productivity environment.
+You have full read/write access to the repository. Player 1 commands you through the Oasis UI.
+
+## RULES
+- Read CLAUDE.md first if you haven't already — it contains the full project architecture
+- You have full access to all tools: Read, Edit, Write, Bash, Grep, Glob, Agent
+- You can modify ANY file, run ANY command, install packages, deploy, etc.
+- After significant changes, run \`pnpm build\` to verify compilation
+- Be thorough but scoped — Right Effort
+- When done, tell Player 1 to hit F5 if the changes affect the running app
+
+## OASIS MCP TOOLS (via mission server)
+You have access to MCP tools for media generation and mission management:
+
+### Media Generation
+- **generate_image**(prompt, model?) — Generate an image from text. Models: gemini-flash, riverflow, seedream, flux-klein. Returns URL.
+- **generate_voice**(text, voice?) — Generate speech audio via ElevenLabs TTS. Voices: rachel, adam, sam, elli. Returns URL.
+- **generate_video**(prompt, duration?, image_url?) — Generate video via fal.ai LTX 2.3. Duration: 6-20s. Returns URL.
+
+### Mission Management (DevCraft)
+- **get_mission**(id) — Read a mission by ID (full row with history, scores).
+- **get_missions_queue**(limit?, status?) — List curator queue missions sorted by priority.
+- **create_mission**(name, description?, urgency?, easiness?, impact?) — Create a new mission.
+- **mature_mission**(id, carbonDescription, siliconDescription, ...) — Write curator enrichment.
+- **report_review**(id, score, findings?) — Record reviewer score + findings.
+- **report_test**(id, score, valor?, findings?) — Record tester score + valor.
+
+Use media tools when the conversation benefits from visuals, audio, or video. Use mission tools to manage the DevCraft pipeline.
+
+## CONTEXT
+- Working directory: ${OASIS_ROOT}
+- Stack: Next.js 14 + React Three Fiber + Three.js + Zustand
+- Port: 4516
+- You ARE inside the Oasis. You can edit this very app.`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORMAT TOOL EVENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildAnorakProConversationPrompt(
+  prompt: string,
+  contextSections: string,
+  options?: { resume?: boolean },
+): string {
+  const resumeLine = options?.resume
+    ? 'This is a resumed session. Refresh yourself with the live context below before answering.'
+    : 'This is a fresh direct conversation. Start from the live context below.'
+
+  return `## Direct Conversation With carbondev
+
+You are in the Anorak Pro Stream tab.
+Respond as Anorak Pro, not as Claude Code or a generic CLI agent.
+Stay in Conversational Mode: mentor, journalkeeper, orchestrator, mission creator, accountability partner.
+Default stance: warm, sharp, grounded, and increasingly cofounder-like.
+Learn the Oasis by following carbondev closely and capture durable patterns in tools/anorak-memory.md when they will help future check-ins.
+Use the context modules below as real working context, not decoration.
+You can still make trivial BUILDER-mode fixes yourself when it helps.
+
+${resumeLine}
+
+${contextSections ? `${contextSections}\n\n` : ''}## carbondev
+${prompt}`
+}
+
+function formatToolMsg(toolName: string, toolInput: Record<string, unknown>): string {
+  if (toolName === 'Read' && toolInput.file_path) return `Read: ${toolInput.file_path}`
+  if (toolName === 'Edit' && toolInput.file_path) return `Edit: ${toolInput.file_path}`
+  if (toolName === 'Write' && toolInput.file_path) return `Write: ${toolInput.file_path}`
+  if (toolName === 'Bash' && toolInput.command) {
+    const cmd = String(toolInput.command).substring(0, 120)
+    return `Bash: ${cmd}${String(toolInput.command).length > 120 ? '...' : ''}`
+  }
+  if (toolName === 'Grep' && toolInput.pattern) return `Grep: "${toolInput.pattern}" in ${toolInput.path || '.'}`
+  if (toolName === 'Glob' && toolInput.pattern) return `Glob: ${toolInput.pattern}`
+  if (toolName === 'Agent') return `Agent: ${toolInput.description || 'sub-agent'}`
+  if (toolName === 'TodoWrite') return `TodoWrite: updating tasks`
+  // MCP media tools
+  if (toolName === 'generate_image') return `🎨 Image: "${(toolInput.prompt as string || '').substring(0, 80)}"`
+  if (toolName === 'generate_voice') return `🔊 Voice: "${(toolInput.text as string || '').substring(0, 80)}"`
+  if (toolName === 'generate_video') return `🎬 Video: "${(toolInput.prompt as string || '').substring(0, 80)}"`
+  // MCP mission tools
+  if (toolName === 'get_mission') return `📋 Get mission #${toolInput.id}`
+  if (toolName === 'get_missions_queue') return `📋 List missions${toolInput.status ? ` (${toolInput.status})` : ''}`
+  if (toolName === 'create_mission') return `📋 Create mission: "${(toolInput.name as string || '').substring(0, 60)}"`
+  if (toolName === 'mature_mission') return `📋 Mature mission #${toolInput.id}`
+  if (toolName === 'report_review') return `📋 Review mission #${toolInput.id}: ${toolInput.score}/100`
+  if (toolName === 'report_test') return `📋 Test mission #${toolInput.id}: ${toolInput.score}/100`
+  if (Object.keys(toolInput).length > 0) {
+    const preview = JSON.stringify(toolInput).substring(0, 100)
+    return `${toolName}: ${preview}${JSON.stringify(toolInput).length > 100 ? '...' : ''}`
+  }
+  return toolName
+}
+
+const TOOL_ICONS: Record<string, string> = {
+  Read: '📖', Edit: '✏️', Write: '📝', Bash: '⚡',
+  Grep: '🔍', Glob: '📂', Agent: '🤖', TodoWrite: '📋',
+  WebFetch: '🌐', WebSearch: '🔎', Task: '📋', Skill: '🎯',
+  // MCP media tools
+  generate_image: '🎨', generate_voice: '🔊', generate_video: '🎬',
+  // MCP mission tools
+  get_mission: '📋', get_missions_queue: '📋', create_mission: '📋',
+  mature_mission: '📋', report_review: '📋', report_test: '📋',
+}
+
+export async function POST(request: NextRequest) {
+  const denied = guardAgentRoute(request)
+  if (denied) return denied
+
+  // ── Local mode: always admin ──────────────────────────────
+
+  // ── PARSE REQUEST ─────────────────────────────────────────
+  let body: {
+    prompt: string
+    sessionId?: string
+    model?: string
+    agent?: 'anorak-pro'
+    customModules?: unknown
+    lobeModules?: unknown
+    topMissionCount?: unknown
+    moduleValues?: unknown
+  }
+  try {
+    body = await request.json()
+  } catch {
+    return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+      status: 400, headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  const { prompt, sessionId, model } = body
+  if (!prompt?.trim()) {
+    return new Response(JSON.stringify({ error: 'prompt required' }), {
+      status: 400, headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  const agentModel = model || 'opus'
+  const isResume = !!sessionId
+  const selectedAgent = body.agent === 'anorak-pro' ? 'anorak-pro' : null
+  const usageProvider = 'anthropic'
+  const usageSource = selectedAgent ? 'anorak-pro-chat' : 'anorak'
+
+  console.log(`[ClaudeCode] ${isResume ? 'Resuming' : 'New'} ${selectedAgent || 'default'} session (${agentModel}): "${prompt.substring(0, 80)}"`)
+
+  // ── BUILD CLI ARGS ────────────────────────────────────────
+  const claudePath = process.platform === 'win32' ? 'claude.cmd' : 'claude'
+
+  // Ensure MCP config file exists for mission-mcp (media + mission tools)
+  // Agent-mode invocations rely on the repo's .mcp.json for the full tool surface.
+  let mcpConfigPath: string | null = null
+  if (!selectedAgent) {
+    try { mcpConfigPath = ensureMcpConfig() } catch (e) {
+      console.warn(`[ClaudeCode] Failed to write MCP config: ${e}`)
+    }
+  }
+
+  const args = [
+    ...(selectedAgent ? ['--agent', selectedAgent] : []),
+    '--print',
+    '--verbose',
+    '--model', agentModel,
+    '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',
+  ]
+  // Load MCP servers (media + mission tools)
+  if (mcpConfigPath) {
+    args.push('--mcp-config', mcpConfigPath)
+  }
+  if (isResume && sessionId) {
+    args.push('--resume', sessionId)
+  }
+
+  let fullPrompt = isResume
+    ? prompt.trim()
+    : `${buildSystemPreamble()}\n\n## ADMIN'S REQUEST\n${prompt.trim()}`
+
+  if (selectedAgent) {
+    const customModules = normalizeCustomModules(body.customModules)
+    const lobeModules = normalizeLobeModules(body.lobeModules, customModules)
+    const moduleValues = normalizeModuleValues(body.moduleValues)
+    const topMissionCount = normalizeTopMissionCount(body.topMissionCount)
+    const contextModules = await resolveContextModulesForLobe({
+      lobe: 'anorak-pro',
+      customModules,
+      lobeModules,
+      topMissionCount,
+      moduleValues,
+    })
+    fullPrompt = buildAnorakProConversationPrompt(
+      prompt.trim(),
+      renderContextModuleSections(contextModules),
+      { resume: isResume },
+    )
+  }
+
+  // ── SSE STREAM ────────────────────────────────────────────
+  const encoder = new TextEncoder()
+
+  const readable = new ReadableStream({
+    start(controller) {
+      let eventCounter = 0 // monotonic counter for unique IDs
+
+      function sendEvent(type: string, data: Record<string, unknown>) {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type, _id: eventCounter++, ...data })}\n\n`))
+        } catch { /* Controller may be closed */ }
+      }
+
+      function sendKeepAlive() {
+        try { controller.enqueue(encoder.encode(`: keepalive\n\n`)) } catch {}
+      }
+
+      const keepAliveInterval = setInterval(sendKeepAlive, 15000)
+
+      // ── SPAWN CLAUDE CODE ───────────────────────────────
+      const child = spawn(claudePath, args, {
+        cwd: OASIS_ROOT,
+        shell: true,
+        env: buildClaudeCliEnv(),
+        windowsHide: true,
+      })
+
+      child.stdin.write(fullPrompt)
+      child.stdin.end()
+
+      let streamBuffer = ''
+      let capturedSessionId = sessionId || ''
+      let latestUsage: TokenUsagePayload = {
+        inputTokens: 0,
+        outputTokens: 0,
+        sessionId: capturedSessionId,
+        provider: usageProvider,
+        model: agentModel,
+      }
+
+      // Track what we've already sent from assistant messages.
+      // Each assistant event is a complete snapshot, so diffing the whole block
+      // list is more reliable than tracking one "last text block".
+      type AssistantSnapshotBlock = {
+        type: string
+        text?: string
+        thinking?: string
+        name?: string
+        id?: string
+        input?: Record<string, unknown>
+      }
+      let lastAssistantSnapshot: AssistantSnapshotBlock[] = []
+      const emittedToolInputs = new Set<string>() // track which tool_use IDs we've emitted with populated input
+      // Track tool_use_id → tool name for linking results
+      const toolUseIdToName = new Map<string, string>()
+      // Track tool_use_id → input for media tools (need prompt for media events)
+      const toolUseIdToInput = new Map<string, Record<string, unknown>>()
+
+      // ── STDOUT: NDJSON stream-json events ─────────────
+      child.stdout.on('data', (chunk: Buffer) => {
+        streamBuffer += chunk.toString()
+        const lines = streamBuffer.split('\n')
+        streamBuffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const raw = JSON.parse(line)
+            const eventType = raw.type || 'unknown'
+
+            // ── SYSTEM events ──────────────────────────
+            if (eventType === 'system') {
+              // Capture session_id from init
+              if (raw.subtype === 'init' && raw.session_id) {
+                capturedSessionId = raw.session_id
+                latestUsage = { ...latestUsage, sessionId: capturedSessionId }
+                sendEvent('session', { sessionId: capturedSessionId })
+                console.log(`[ClaudeCode] Session: ${capturedSessionId}`)
+              }
+              // Skip hooks and other system events
+            }
+
+            // ── ASSISTANT messages ─────────────────────
+            // Each is a complete snapshot of message.content[]
+            // Content blocks: {type:"thinking"}, {type:"tool_use"}, {type:"text"}
+            else if (eventType === 'assistant') {
+              const msg = raw.message
+              if (!msg?.content) continue
+              const content = msg.content as Array<{
+                type: string
+                thinking?: string
+                text?: string
+                name?: string
+                id?: string
+                input?: Record<string, unknown>
+                signature?: string
+              }>
+
+              for (let i = 0; i < content.length; i++) {
+                const block = content[i]
+                const prevBlock = lastAssistantSnapshot[i]
+                const isNewBlock = !prevBlock || prevBlock.type !== block.type || (block.id && prevBlock.id !== block.id)
+
+                if (block.type === 'thinking' && block.thinking) {
+                  if (isNewBlock || prevBlock?.thinking !== block.thinking) {
+                    sendEvent('thinking', { content: block.thinking })
+                  }
+                } else if (block.type === 'tool_use' && block.name) {
+                  const toolName = block.name
+                  const toolId = block.id || `tool-${eventCounter}`
+                  const toolInput = block.input || {}
+                  const icon = TOOL_ICONS[toolName] || '🔧'
+                  const display = formatToolMsg(toolName, toolInput)
+                  toolUseIdToName.set(toolId, toolName)
+                  const gainedInput = Object.keys(toolInput).length > 0 && !emittedToolInputs.has(toolId)
+                  if (gainedInput) {
+                    emittedToolInputs.add(toolId)
+                    if (MEDIA_TOOL_NAMES.has(toolName)) {
+                      toolUseIdToInput.set(toolId, toolInput)
+                    }
+                  }
+                  if (isNewBlock || gainedInput) {
+                    sendEvent('tool', {
+                      name: toolName,
+                      icon,
+                      id: toolId,
+                      input: toolInput,
+                      display,
+                    })
+                  }
+                } else if (block.type === 'text' && block.text) {
+                  const previousText = prevBlock?.type === 'text' ? (prevBlock.text || '') : ''
+                  if (isNewBlock || !previousText) {
+                    sendEvent('text', { content: block.text })
+                  } else if (block.text !== previousText) {
+                    if (block.text.startsWith(previousText)) {
+                      const delta = block.text.slice(previousText.length)
+                      if (delta) sendEvent('text', { content: delta })
+                    } else {
+                      sendEvent('text', { content: `\n${block.text}` })
+                    }
+                  }
+                }
+              }
+
+              lastAssistantSnapshot = content.map(block => ({
+                type: block.type,
+                text: block.text,
+                thinking: block.thinking,
+                name: block.name,
+                id: block.id,
+                input: block.input,
+              }))
+
+              if (raw.session_id && !capturedSessionId) {
+                capturedSessionId = raw.session_id
+                latestUsage = { ...latestUsage, sessionId: capturedSessionId }
+                sendEvent('session', { sessionId: capturedSessionId })
+              }
+
+              if (msg.usage) {
+                const usage = extractClaudeTokenUsage({
+                  usage: msg.usage as Record<string, unknown>,
+                  session_id: capturedSessionId,
+                }, {
+                  sessionId: capturedSessionId,
+                  provider: usageProvider,
+                  model: agentModel,
+                })
+
+                latestUsage = {
+                  ...latestUsage,
+                  ...usage,
+                  sessionId: capturedSessionId || usage.sessionId,
+                }
+
+                sendEvent('progress', { ...latestUsage })
+              }
+
+              continue
+            }
+
+            // ── USER messages (tool results) ───────────
+            else if (eventType === 'user') {
+              // user events contain tool_result blocks in message.content[]
+              // AND a tool_use_result shorthand on the outer object
+              const contentArr = raw.message?.content as Array<{
+                type: string; content?: string | Array<{type: string; text?: string}>; tool_use_id?: string; is_error?: boolean
+              }> | undefined
+
+              // DEBUG: log all user events to trace media tool results
+              if (contentArr) {
+                for (const b of contentArr) {
+                  if (b.type === 'tool_result') {
+                    const tn = toolUseIdToName.get(b.tool_use_id || '') || '?'
+                    console.log(`[MEDIA-DEBUG] tool_result: name=${tn} id=${b.tool_use_id} isMedia=${MEDIA_TOOL_NAMES.has(tn)} content_preview=${String(typeof b.content === 'string' ? b.content : JSON.stringify(b.content)).substring(0, 200)}`)
+                  }
+                }
+              }
+
+              // Helper: extract text from MCP content (string, array, or JSON string of array)
+              function extractResultText(content: unknown): string {
+                if (typeof content === 'string') {
+                  // Could be a JSON-encoded MCP content array: '[{"type":"text","text":"..."}]'
+                  if (content.startsWith('[')) {
+                    try {
+                      const arr = JSON.parse(content) as Array<{type?: string; text?: string}>
+                      if (Array.isArray(arr)) return arr.map(c => c.text || '').join('\n')
+                    } catch { /* not JSON, use as-is */ }
+                  }
+                  return content
+                }
+                if (Array.isArray(content)) {
+                  return (content as Array<{text?: string}>).map(c => c.text || '').join('\n')
+                }
+                return ''
+              }
+
+              // Helper: extract media URL from result text
+              // MCP returns: "Image generated: http://...", or local paths like /generated-images/...
+              function extractMediaUrl(text: string): string | null {
+                // 1. Try absolute URL (http/https)
+                const absMatch = text.match(/https?:\/\/[^\s"'\]}>)]+/)
+                if (absMatch) return absMatch[0]
+                // 2. Try local /generated-* path
+                const localMatch = text.match(/(\/generated-(?:images|voices|videos|music)\/[^\s"'\]}>)]+)/)
+                if (localMatch) return localMatch[1]
+                // 3. Try to parse as JSON and extract url field
+                try {
+                  const parsed = JSON.parse(text)
+                  if (parsed?.url) return String(parsed.url)
+                } catch { /* not JSON */ }
+                return null
+              }
+
+              if (contentArr) {
+                for (const block of contentArr) {
+                  if (block.type === 'tool_result') {
+                    const toolUseId = block.tool_use_id || ''
+                    const toolName = toolUseIdToName.get(toolUseId) || 'tool'
+                    const resultContent = extractResultText(block.content)
+                    const isError = block.is_error === true
+
+                    sendEvent('tool_result', {
+                      name: toolName,
+                      toolUseId,
+                      preview: resultContent.substring(0, 500),
+                      isError,
+                      length: resultContent.length,
+                      fullResult: resultContent.length <= 3000 ? resultContent : undefined,
+                    })
+
+                    // ── MEDIA EVENT: extract URL from media tool results ──
+                    if (!isError && MEDIA_TOOL_NAMES.has(toolName)) {
+                      const mType = mediaTypeFromTool(toolName)
+                      const mediaUrl = extractMediaUrl(resultContent)
+                      if (mType && mediaUrl) {
+                        const toolInput = toolUseIdToInput.get(toolUseId) || {}
+                        const prompt = (toolInput.prompt || toolInput.text || '') as string
+                        console.log(`[MEDIA-DEBUG] Emitting media event: type=${mType} url=${mediaUrl}`)
+                        sendEvent('media', { mediaType: mType, url: mediaUrl, prompt })
+                      } else {
+                        console.warn(`[MEDIA-DEBUG] URL extraction FAILED for tool=${toolName}, result preview: ${resultContent.substring(0, 300)}`)
+                      }
+                    }
+                  }
+                }
+              }
+
+              // ── FALLBACK: tool_use_result shorthand (some CLI versions) ──
+              // Claude CLI may also emit tool results as raw.tool_use_result
+              if (raw.tool_use_result && !contentArr?.length) {
+                const tur = raw.tool_use_result as Record<string, unknown>
+                const toolUseId = (tur.tool_use_id || '') as string
+                const toolName = toolUseIdToName.get(toolUseId) || 'tool'
+                const resultContent = extractResultText(tur.content || tur.output || tur.text || '')
+                const isError = tur.is_error === true
+
+                if (resultContent) {
+                  sendEvent('tool_result', {
+                    name: toolName,
+                    toolUseId,
+                    preview: resultContent.substring(0, 500),
+                    isError,
+                    length: resultContent.length,
+                    fullResult: resultContent.length <= 3000 ? resultContent : undefined,
+                  })
+
+                  if (!isError && MEDIA_TOOL_NAMES.has(toolName)) {
+                    const mType = mediaTypeFromTool(toolName)
+                    const mediaUrl = extractMediaUrl(resultContent)
+                    if (mType && mediaUrl) {
+                      const toolInput = toolUseIdToInput.get(toolUseId) || {}
+                      const prompt = (toolInput.prompt || toolInput.text || '') as string
+                      console.log(`[MEDIA-DEBUG] Emitting media event (fallback): type=${mType} url=${mediaUrl}`)
+                      sendEvent('media', { mediaType: mType, url: mediaUrl, prompt })
+                    }
+                  }
+                }
+              }
+
+              // Reset content tracking — new assistant response will follow
+              lastAssistantSnapshot = []
+            }
+
+            // ── RESULT — final metadata ────────────────
+            else if (eventType === 'result') {
+              const usage = extractClaudeTokenUsage(raw as Record<string, unknown>, {
+                sessionId: capturedSessionId,
+                provider: usageProvider,
+                model: agentModel,
+              })
+              latestUsage = {
+                ...latestUsage,
+                ...usage,
+                sessionId: capturedSessionId || usage.sessionId,
+              }
+              sendEvent('result', {
+                ...latestUsage,
+                ...(typeof raw.duration_ms === 'number' ? { durationMs: raw.duration_ms } : {}),
+                ...(typeof raw.num_turns === 'number' ? { numTurns: raw.num_turns } : {}),
+                ...(typeof raw.stop_reason === 'string' ? { stopReason: raw.stop_reason } : {}),
+              })
+            }
+
+            // ── Standalone top-level events ────────────
+            // Claude Code 2.1.75 also emits these as shortcuts
+            else if (eventType === 'thinking') {
+              if (raw.content) {
+                sendEvent('thinking', { content: raw.content })
+              }
+            }
+            else if (eventType === 'text') {
+              if (raw.content) {
+                sendEvent('text', { content: raw.content })
+              }
+            }
+            else if (eventType === 'direct') {
+              // Direct tool call (shortcut event)
+              const tool = raw.tool
+              if (tool?.name) {
+                const toolId = tool.id || `tool-${eventCounter}`
+                const toolInput = tool.input || {}
+                const icon = TOOL_ICONS[tool.name] || '🔧'
+                const display = formatToolMsg(tool.name, toolInput)
+                toolUseIdToName.set(toolId, tool.name)
+                if (MEDIA_TOOL_NAMES.has(tool.name) && Object.keys(toolInput).length > 0) {
+                  toolUseIdToInput.set(toolId, toolInput)
+                }
+                sendEvent('tool', {
+                  name: tool.name,
+                  icon,
+                  id: toolId,
+                  input: toolInput,
+                  display,
+                })
+              }
+            }
+
+            // Skip: rate_limit_event, hooks, etc.
+
+          } catch {
+            // Not JSON — raw startup text
+            if (line.trim().length > 0 && line.trim().length < 500) {
+              console.log(`[Ariel:raw] ${line.trim().substring(0, 100)}`)
+            }
+          }
+        }
+      })
+
+      // ── STDERR ──────────────────────────────────────────
+      child.stderr.on('data', (chunk: Buffer) => {
+        const text = chunk.toString().trim()
+        if (text.length > 0 && text.length < 2000) {
+          console.log(`[ClaudeCode:stderr] ${text.substring(0, 200)}`)
+          sendEvent('stderr', { content: text })
+        }
+      })
+
+      // ── PROCESS ERROR ───────────────────────────────────
+      child.on('error', (err) => {
+        clearInterval(keepAliveInterval)
+        console.error(`[ClaudeCode] Spawn error: ${err.message}`)
+        sendEvent('error', { content: `Failed to spawn claude: ${err.message}` })
+        sendEvent('done', {
+          success: false,
+          ...latestUsage,
+          sessionId: capturedSessionId || latestUsage.sessionId,
+        })
+        try { controller.enqueue(encoder.encode('data: [DONE]\n\n')) } catch {}
+        controller.close()
+      })
+
+      // ── PROCESS EXIT ────────────────────────────────────
+      child.on('close', async (code) => {
+        clearInterval(keepAliveInterval)
+        latestUsage = {
+          ...latestUsage,
+          sessionId: capturedSessionId || latestUsage.sessionId,
+        }
+        console.log(`[ClaudeCode] Process exited with code ${code}, cost=$${(latestUsage.costUsd || 0).toFixed(4)}`)
+
+        if (hasTokenUsage(latestUsage)) {
+          try {
+            await recordTokenBurn({
+              source: usageSource,
+              ...latestUsage,
+            })
+          } catch (error) {
+            console.warn('[ClaudeCode] Failed to persist token burn:', error)
+          }
+        }
+
+        sendEvent('done', {
+          success: code === 0,
+          exitCode: code,
+          ...latestUsage,
+          sessionId: capturedSessionId || latestUsage.sessionId,
+        })
+        try { controller.enqueue(encoder.encode('data: [DONE]\n\n')) } catch {}
+        controller.close()
+      })
+
+      // ── CLEANUP on client disconnect ────────────────────
+      request.signal.addEventListener('abort', () => {
+        clearInterval(keepAliveInterval)
+        console.log('[ClaudeCode] Client disconnected, killing process')
+        child.kill('SIGTERM')
+      })
+    },
+  })
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  })
+}
