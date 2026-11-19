@@ -28,6 +28,7 @@ import {
 } from './village-actions'
 import { VillageComposer } from './VillageComposer'
 import { EffortSelect } from './EffortSelect'
+import { AccountSelect } from './AccountSelect'
 import { EyesToggle } from './EyesToggle'
 import { ChromeToggle } from './ChromeToggle'
 import { FollowToggle, VoiceToggle } from './CompanionToggles'
@@ -37,6 +38,8 @@ import { usePanelLook } from './PanelLook'
 import { VILLAGE_FONT_BODY, VILLAGE_FONT_DISPLAY, VILLAGE_TYPE_CLASS, agentDisplayName, canTalkTo, cwdLabel, formatCost, modelLabel, statusColor, statusLabel } from './village-status'
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'auto', 'plan', 'bypassPermissions']
+/** A Hermes agent's modes (ACP session/set_mode): ask before edits, allow workspace edits, allow edits except sensitive paths. */
+const HERMES_MODES = ['default', 'accept_edits', 'dont_ask']
 
 function useViewport() {
   const [size, setSize] = useState(() => ({
@@ -276,16 +279,18 @@ export function AgentSessionPanel() {
               className="rounded border border-white/15 bg-black/50 px-1 py-0.5 text-[11px] text-white"
             >
               <option value="">{`settings (${agent.effectivePermissionMode || '?'})`}</option>
-              {PERMISSION_MODES.map(mode => <option key={mode} value={mode}>{mode}</option>)}
+              {(agent.runtime === 'hermes' ? HERMES_MODES : PERMISSION_MODES).map(mode => <option key={mode} value={mode}>{mode}</option>)}
             </select>
           </label>
           <EffortSelect agent={agent} />
+          {/* Its Claude account (engine accounts.js), when there is more than one. */}
+          <AccountSelect agent={agent} />
           <EyesToggle agent={agent} />
           <ChromeToggle agent={agent} />
           <AcademyTrainToggle agent={agent} />
           <FollowToggle agent={agent} />
           <VoiceToggle agent={agent} />
-          <span className="ml-auto truncate text-white/60">{modelLabel(agent)}</span>
+          <span className="ml-auto truncate text-white/60">{agent.runtime === 'hermes' ? `Hermes${agent.remoteHost ? ` on ${agent.remoteHost}` : ''} · ` : ''}{modelLabel(agent)}</span>
         </div>
       )}
 

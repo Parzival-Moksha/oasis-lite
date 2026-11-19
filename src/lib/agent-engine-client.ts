@@ -288,6 +288,11 @@ export class AgentEngineClient {
     return this.cmd('voiceMessage', { agentId, audio, mime, ...(durationMs ? { durationMs } : {}), ...(priority ? { priority } : {}) }, { timeoutMs })
   }
 
+  /** A new name for an agent the Oasis runs: its session, desk, voice, look and history stay (engine rename). */
+  rename(agentId: string, name: string) {
+    return this.cmd('rename', { agentId, name })
+  }
+
   /** The md reader: a text file an agent sent (the engine allows only those, .md / .markdown / .txt). */
   readFile(fileId: string) {
     return this.cmd('readFile', { fileId })
@@ -424,6 +429,20 @@ export class AgentEngineClient {
 
   wakeNow(agentId: string) {
     return this.cmd('wakeNow', { agentId, by: 'the owner' })
+  }
+
+  /** Claude accounts (engine accounts.js): never a token here. */
+  listAccounts() {
+    return this.cmd('listAccounts', {})
+  }
+
+  setDefaultAccount(account: string) {
+    return this.cmd('setDefaultAccount', { account })
+  }
+
+  /** Pin one agent to an account, or null for the village's choice. */
+  setAccount(agentId: string, account: string | null) {
+    return this.cmd('setAccount', { agentId, account })
   }
 
   /** Quiet hours and the daily cap, for all agents. With no argument: read them. */
@@ -595,6 +614,11 @@ export class AgentEngineClient {
         this.flushDeltas()
         this.dispatch({ type: 'agents', agents: message.agents || [], at: this.now() })
         return
+      case 'accounts': {
+        const { type: _type, ...accounts } = message
+        this.dispatch({ type: 'accounts', accounts })
+        return
+      }
       case 'event': {
         const event = message.event
         if (!event || typeof event !== 'object') return

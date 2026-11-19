@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { AgentSelectionSection } from './AgentSelectionSection'
 import { CharacterSection } from './CharacterSection'
+import { RenameSection } from './RenameSection'
 import { ScheduleSection } from './ScheduleSection'
 
 import { AGENT_AVATAR_CATALOG } from '../../lib/agent-avatar-catalog'
@@ -34,6 +35,7 @@ import { SPEECH_SPEED, VILLAGE_VOICES, villageVoice } from '../../lib/village/vi
 import type { EngineAgentState } from '../../store/slices/agentEngineSlice'
 import { AvatarGallery } from '../forge/AvatarGallery'
 import { pressVillageFollow, setVillageFollowFor, useVillageFollowView } from './follow-view'
+import { HomeSection } from './HomeSection'
 import { showNotice } from '../forge/GlobalNotice'
 import {
   agentVoiceChosenBy,
@@ -204,12 +206,15 @@ export function AgentSettingsButton({ agent, large = false }: { agent: Pick<Engi
       </button>
       {open && (
         <div data-agent-settings-menu className="absolute right-0 top-9 z-50 max-h-[min(78vh,760px)] w-[280px] overflow-y-auto rounded-lg border border-white/15 bg-slate-950/95 p-3 text-left text-[11px] font-normal normal-case tracking-normal text-white shadow-[0_18px_50px_rgba(0,0,0,0.6)]">
+          {/* Its name (engine rename): only agents the Oasis runs; a session in another window keeps its own. */}
+          {agent.owned && <RenameSection agentId={agent.id} name={agent.name} />}
           {/* Who it is: role and who-you-are, kept by the engine as a card per agent (CharacterSection). */}
           <CharacterSection agentId={agent.id} name={name} />
           {/* When it wakes up on its own (engine schedule.js). Only agents the Oasis runs can be woken. */}
           {agent.owned && <ScheduleSection agent={agent} name={name} />}
           {agent.owned && <VoiceSection agent={agent} agentKey={agentKey} />}
           <WalkingSection agentId={agent.id} agentKey={agentKey} name={agent.name} />
+          <HomeSection agentKey={agentKey} name={name} />
           <AgentSelectionSection agentId={agent.id} agentKey={agentKey} name={agent.name} />
 
           <div className={HEADING}>Avatar · {name}</div>
