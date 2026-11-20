@@ -6,10 +6,11 @@
 // movement key can get stuck (the WASD-stuck bug class).
 
 import { useEffect, useMemo, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react'
+import { kitConfirm } from '../ui-kit'
 import { CUSTOM_MODEL_VALUE, cleanModelId, mergeModelLists, type ModelOption } from '../../lib/village/village-models'
 import { useOasisStore } from '../../store/oasisStore'
 import { useUILayer } from '../../lib/input-manager'
-import { effectiveStatus } from '../../store/slices/agentEngineSlice'
+import { effectiveStatus, type EngineAgentState } from '../../store/slices/agentEngineSlice'
 import { getAgentEngineClient } from '../../lib/agent-engine-client'
 import { showNotice } from '../forge/GlobalNotice'
 import { AgentSessionView, StatusPill } from './AgentSessionView'
@@ -24,21 +25,60 @@ import {
   setSessionPanelWidth,
   subscribeSessionPanelWidth,
   subscribeVillageScreen,
-  toggleVillageScreen,
+  pressVillageView,
 } from './village-actions'
 import { VillageComposer } from './VillageComposer'
 import { EffortSelect } from './EffortSelect'
 import { AccountSelect } from './AccountSelect'
 import { EyesToggle } from './EyesToggle'
 import { ChromeToggle } from './ChromeToggle'
-import { FollowToggle, VoiceToggle } from './CompanionToggles'
-import { AgentSettingsButton } from './AgentSettingsMenu'
+import { VoiceKitToggle } from './CompanionToggles'
+import { AgentSettingsSections } from './AgentSettingsMenu'
 import { AcademyTrainToggle } from './VillageAcademyTrainee'
 import { usePanelLook } from './PanelLook'
 import { dismissVillageAgent } from './village-leave'
+import { AgentWhereBar } from './AgentWhereBar'
+import { AgentPanelTabBar, ThreadFontScale, ThreadFontSlider, useAgentPanelTab } from './AgentPanelTabs'
+import { KitSelectField } from '@/components/ui-kit'
 import { VILLAGE_FONT_BODY, VILLAGE_FONT_DISPLAY, VILLAGE_TYPE_CLASS, agentDisplayName, canTalkTo, cwdLabel, formatCost, modelLabel, statusColor, statusLabel } from './village-status'
+import { useKitStyle } from '@/components/ui-kit'
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'auto', 'plan', 'bypassPermissions']
+/** What each mode means, in one line (the restart confirm says it). */
+const MODE_MEANING: Record<string, string> = {
+  default: 'It asks you before edits, commands and other tools.',
+  acceptEdits: 'It edits files without asking, and asks before commands.',
+  auto: 'It decides by itself what is safe, and asks you about the rest.',
+  plan: 'It only reads and plans: it changes nothing.',
+  bypassPermissions: 'It does everything without asking: edits, commands, the network.',
+}
+
+/**
+ * Switch an agent's mode. When the running process can't take it (bypass on a session not started with it), the
+ * Oasis asks and then restarts that agent in the mode with the same session (engine agent.js setPermissionMode).
+ */
+async function switchMode(agentId: string, name: string, mode: string): Promise<void> {
+  const client = getAgentEngineClient()
+  try {
+    await client.setPermissionMode(agentId, mode)
+  } catch (error) {
+    const data = (error as { data?: { needsRestart?: boolean } }).data
+    if (!data?.needsRestart) { showNotice(`Mode switch failed: ${describeError(error)}`, 'error'); return }
+    const ok = await kitConfirm({
+      title: `Restart ${name} in ${mode}?`,
+      body: `${MODE_MEANING[mode] || ''} Its running process can't switch to this mode, so it restarts with the same session: the conversation stays. If it is working, after this turn.`,
+      confirm: 'Restart in this mode',
+      danger: mode === 'bypassPermissions',
+    })
+    if (!ok) return
+    try {
+      const reply = await client.setPermissionMode(agentId, mode, true) as { data?: { applied?: string } }
+      showNotice(`${name} restarts in ${mode}${reply?.data?.applied === 'after this turn' ? ' after this turn' : ''}.`, 'info')
+    } catch (err) {
+      showNotice(`Mode switch failed: ${describeError(err)}`, 'error')
+    }
+  }
+}
 /** A Hermes agent's modes (ACP session/set_mode): ask before edits, allow workspace edits, allow edits except sensitive paths. */
 const HERMES_MODES = ['default', 'accept_edits', 'dont_ask']
 
@@ -128,7 +168,12 @@ export function AgentSessionPanel() {
   const mergedModels = useMemo(() => JSON.parse(mergedModelsKey) as ModelOption[], [mergedModelsKey])
   // Transparency + blur for all agent chats, this agent's colour (PanelLook.tsx).
   const { accent: panelAccent, ...panelLook } = usePanelLook(agent?.sessionId || agentId || '')
+  // The one menu style (ui-kit): Glass keeps this agent's own colour, see-through and blur; a textured style dresses the panel like every menu.
+  const menuStyle = useKitStyle()
+  const textured = menuStyle !== 'glass'
 
+  // The page shown (thread or settings): a hook, so above the early return below.
+  const panelTab = useAgentPanelTab()
   // F: the agent's own screen took over (camera + composer in the world); the layer above stays pushed.
   if (!agentId || !agent || screenAgentId === agentId) return null
   const geometry = getSessionPanelGeometry(viewport.width, viewport.height)
@@ -172,8 +217,13 @@ export function AgentSessionPanel() {
   return (
     <div
       data-ui-panel="village-session"
-      className={`fixed flex flex-col gap-2 rounded-xl border bg-slate-950/95 p-3 text-white shadow-[0_24px_70px_rgba(0,0,0,0.55)] backdrop-blur-xl ${VILLAGE_TYPE_CLASS}`}
-      style={{ ...style, ...panelLook, borderColor: `${color}88`, boxShadow: `inset 0 3px 0 ${panelAccent}, 0 24px 70px rgba(0,0,0,0.55)`, fontFamily: VILLAGE_FONT_BODY }}
+      data-kit-style={textured ? menuStyle : undefined}
+      className={textured
+        ? `kit-panel fixed flex flex-col gap-2 p-3 text-white ${VILLAGE_TYPE_CLASS}`
+        : `fixed flex flex-col gap-2 rounded-xl border bg-slate-950/95 p-3 text-white shadow-[0_24px_70px_rgba(0,0,0,0.55)] backdrop-blur-xl ${VILLAGE_TYPE_CLASS}`}
+      style={textured
+        ? { ...style, boxShadow: `0 24px 70px rgba(0,0,0,0.55)` }
+        : { ...style, ...panelLook, borderColor: `${color}88`, boxShadow: `inset 0 3px 0 ${panelAccent}, 0 24px 70px rgba(0,0,0,0.55)`, fontFamily: VILLAGE_FONT_BODY }}
       onPointerDown={() => bringToFront('village-session')}
     >
       {geometry.side === 'right' && (
@@ -203,10 +253,6 @@ export function AgentSessionPanel() {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {/* One settings menu per agent: voice and speed, avatar, colour, and the look of all chats. */}
-          <AgentSettingsButton agent={agent} />
-          {/* Watched sessions have no settings row: their Follow me switch sits here. */}
-          {!agent.owned && <FollowToggle agent={agent} />}
           <button
             type="button"
             disabled={busy}
@@ -218,7 +264,7 @@ export function AgentSessionPanel() {
           </button>
           <button
             type="button"
-            onClick={() => toggleVillageScreen()}
+            onClick={() => pressVillageView('F')}
             title="Zoom into the agent's screen and talk there (F)"
             className="rounded-md border border-white/15 bg-white/5 px-2 py-1 font-mono text-[10.5px] font-bold text-white/85 transition hover:bg-white/15"
           >
@@ -235,62 +281,20 @@ export function AgentSessionPanel() {
         </div>
       </div>
 
-      {/* An agent you only watch can be a trainee too. */}
-      {!agent.owned && <div className="flex shrink-0"><AcademyTrainToggle agent={agent} /></div>}
-      {agent.owned && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 text-[10.5px] text-white/75">
-          <label className="flex items-center gap-1">
-            model
-            <select
-              value={models.some(m => m.value === currentModel) ? currentModel : '__current'}
-              onChange={event => {
-                let model: string | null = event.target.value
-                if (!model || model === '__current') return
-                if (model === CUSTOM_MODEL_VALUE) {
-                  model = cleanModelId(window.prompt('Model id (any the Claude Code CLI takes, e.g. claude-fable-5-2)', ''))
-                  if (!model) return
-                }
-                getAgentEngineClient().setModel(agent.id, model).catch(error => showNotice(`Model switch failed: ${describeError(error)}`, 'error'))
-              }}
-              onKeyDown={event => event.stopPropagation()}
-              className="max-w-[150px] rounded border border-white/15 bg-black/50 px-1 py-0.5 text-[11px] text-white"
-            >
-              {!models.some(m => m.value === currentModel) && <option value="__current">{modelLabel(agent)}</option>}
-              {models.map(model => <option key={model.value} value={model.value}>{model.displayName || model.value}</option>)}
-              <option value={CUSTOM_MODEL_VALUE}>Other model id…</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-1">
-            mode
-            <select
-              value={agent.permissionMode || ''}
-              onChange={event => {
-                const mode = event.target.value
-                if (!mode) return
-                getAgentEngineClient().setPermissionMode(agent.id, mode).catch(error => showNotice(`Mode switch failed: ${describeError(error)}`, 'error'))
-              }}
-              onKeyDown={event => event.stopPropagation()}
-              className="rounded border border-white/15 bg-black/50 px-1 py-0.5 text-[11px] text-white"
-            >
-              <option value="">{`settings (${agent.effectivePermissionMode || '?'})`}</option>
-              {(agent.runtime === 'hermes' ? HERMES_MODES : PERMISSION_MODES).map(mode => <option key={mode} value={mode}>{mode}</option>)}
-            </select>
-          </label>
-          <EffortSelect agent={agent} />
-          {/* Its Claude account (engine accounts.js), when there is more than one. */}
-          <AccountSelect agent={agent} />
-          <EyesToggle agent={agent} />
-          <ChromeToggle agent={agent} />
-          <AcademyTrainToggle agent={agent} />
-          <FollowToggle agent={agent} />
-          <VoiceToggle agent={agent} />
-          <span className="ml-auto truncate text-white/60">{agent.runtime === 'hermes' ? `Hermes${agent.remoteHost ? ` on ${agent.remoteHost}` : ''} · ` : ''}{modelLabel(agent)}</span>
-        </div>
-      )}
+      {/* Two pages (AgentPanelTabs.tsx): the thread, and its settings (model, mode, the switches, text size). */}
+      <AgentPanelTabBar />
+      {panelTab === 'settings' ? (
+        <AgentControls agent={agent} />
+      ) : (
+        <>
+      {/* Where it is when that is not here: Call here / Go there / Send home (village-worlds.ts). */}
+      <AgentWhereBar agentId={agent.id} />
 
       <div className="min-h-0 flex-1">
-        <AgentSessionView agentId={agent.id} variant="2d" />
+        <ThreadFontScale><AgentSessionView agentId={agent.id} variant="2d" /></ThreadFontScale>
       </div>
+        </>
+      )}
 
       {/* Keyed by agent: N to the next agent gets a fresh box, and T's "mic on" request finds it. */}
       {agent.owned ? (
@@ -303,6 +307,74 @@ export function AgentSessionPanel() {
       ) : canTalkTo(agent) ? composer : (
         <ObservedFooter agentId={agent.id} />
       )}
+    </div>
+  )
+}
+
+/**
+ * The agent's settings page (its panel's Settings tab, in the side panel and on the full screen): model and mode on
+ * top, then thinking, account and its switches, Follow across worlds, and the thread's text size.
+ */
+export function AgentControls({ agent }: { agent: EngineAgentState }) {
+  const mergedModelsKey = useOasisStore(s => JSON.stringify(mergeModelLists(Object.values(s.agentEngine.agents).map(a => a.models))))
+  const mergedModels = useMemo(() => JSON.parse(mergedModelsKey) as ModelOption[], [mergedModelsKey])
+  const models = mergeModelLists([agent.models, mergedModels])
+  const currentModel = agent.model || 'default'
+  return (
+    <div data-agent-settings-tab className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1 text-[11.5px]">
+      {agent.owned ? (
+        <>
+          {/* Model, mode and thinking: one row (the owner, 2026-11-20: "they should fit in one line"). */}
+          <div data-agent-model-row className="grid grid-cols-3 items-end gap-2 [&>*]:min-w-0 [&_select]:w-full">
+          <KitSelectField
+              label="Model"
+              value={models.some(m => m.value === currentModel) ? currentModel : '__current'}
+              onChange={event => {
+                let model: string | null = event.target.value
+                if (!model || model === '__current') return
+                if (model === CUSTOM_MODEL_VALUE) {
+                  model = cleanModelId(window.prompt('Model id (any the Claude Code CLI takes, e.g. claude-fable-5-2)', ''))
+                  if (!model) return
+                }
+                getAgentEngineClient().setModel(agent.id, model).catch(error => showNotice(`Model switch failed: ${describeError(error)}`, 'error'))
+              }}
+              onKeyDown={event => event.stopPropagation()}
+            >
+              {!models.some(m => m.value === currentModel) && <option value="__current">{modelLabel(agent)}</option>}
+              {models.map(model => <option key={model.value} value={model.value}>{model.displayName || model.value}</option>)}
+              <option value={CUSTOM_MODEL_VALUE}>Other model id…</option>
+          </KitSelectField>
+          <KitSelectField
+              label="Mode"
+              value={agent.permissionMode || ''}
+              onChange={event => {
+                const mode = event.target.value
+                if (!mode) return
+                void switchMode(agent.id, agent.name, mode)
+              }}
+              onKeyDown={event => event.stopPropagation()}
+            >
+              <option value="">{`settings (${agent.effectivePermissionMode || '?'})`}</option>
+              {(agent.runtime === 'hermes' ? HERMES_MODES : PERMISSION_MODES).map(mode => <option key={mode} value={mode}>{mode}</option>)}
+          </KitSelectField>
+          <EffortSelect agent={agent} />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+          {/* Its Claude account (engine accounts.js), when there is more than one. */}
+          <AccountSelect agent={agent} />
+          <EyesToggle agent={agent} />
+          <ChromeToggle agent={agent} />
+          <AcademyTrainToggle agent={agent} />
+          </div>
+          <VoiceKitToggle agent={agent} />
+        </>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2"><AcademyTrainToggle agent={agent} /></div>
+      )}
+      <ThreadFontSlider />
+      <div className="kit-hint">{agent.runtime === 'hermes' ? `Hermes${agent.remoteHost ? ` on ${agent.remoteHost}` : ''} · ` : ''}{modelLabel(agent)}</div>
+      {/* What the gear rolled down before (name, character, schedule, voice, walking, home, avatar, colour, all chats). */}
+      <AgentSettingsSections agent={agent} />
     </div>
   )
 }

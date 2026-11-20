@@ -190,10 +190,11 @@ Why: the generation service's terms, not checked.
 - `public/conjured/conj_mn6ogn4ae05j.glb`
 - `public/conjured/conj_mn6ogn4ae05j_thumb.jpg`
 
-### Mixkit spell sounds and the owner's recordings (14 files, 1.7 MiB)
+### Mixkit spell sounds and the owner's recordings (15 files, 1.7 MiB)
 
 Why: Mixkit forbids passing its files on; the recordings are personal.
 
+- `public/audio/spells/conjuration-incantation.mp3`
 - `public/audio/spells/manifest.json`
 - `public/audio/spells/mixkit-choir-magic-shine-658.ogg`
 - `public/audio/spells/mixkit-cinematic-swell-stark-transition-2675.ogg`

@@ -79,6 +79,7 @@ import { isProbablyMobileDevice } from '@/lib/mobile-controls'
 import { useIsHostedOasis, useOasisCapabilities } from '@/lib/oasis-mode-client'
 import { isVillageProfileClient } from '@/lib/oasis-profile'
 import { VillageWorld } from './village/VillageWorld'
+import { VillageIdentityGate } from './village/VillageIdentityGate'
 import { VillageController } from './village/VillageController'
 import { VillageHud } from './village/VillageHud'
 import { AgentSessionPanel } from './village/AgentSessionPanel'
@@ -115,6 +116,7 @@ import { PerfHeartbeat } from './forge/PerfHeartbeat'
 import { SunShadows } from './forge/SunShadows'
 import { RenderHygiene } from './forge/RenderHygiene'
 import { FlopSaverDriver } from './forge/FlopSaverDriver'
+import { AwayModeDriver, AwayOverlay } from './forge/AwayMode'
 import { useFlopCaps } from '@/lib/use-flop-caps'
 import { GameMenu, OPEN_CONFIG_EVENT, OPEN_HELP_EVENT } from './game-menu/GameMenu'
 import { CharacterMenu } from './village/CharacterMenu'
@@ -2120,7 +2122,7 @@ export default function Scene() {
           {!villageProfile && <RookieMerlinWorldPrompt />}
         </Suspense>
         {/* ─═̷─═̷─🏘 VILLAGE — engine agents at desks around the spawn point ─═̷─═̷─🏘 */}
-        {villageProfile && <VillageWorld />}
+        {villageProfile && <VillageIdentityGate><VillageWorld /></VillageIdentityGate>}
         {/* ─═̷─═̷─⚔ Combat-bolt dispatcher — replaces the legacy FireboltLayer
             and routes to the 10 designs in src/components/forge/bolts/ based
             on settings.{spell}Design. Mounted only when RP1/exploration mode
@@ -2144,6 +2146,8 @@ export default function Scene() {
         <RenderHygiene />
         {/* Flop saver: effects off by tiers while the frame rate stays under 30 (Settings → Graphics) */}
         <FlopSaverDriver />
+        {/* Away mode: the world stops drawing while the owner is away (Settings → Graphics → Rest when away, F8) */}
+        <AwayModeDriver />
         {/* The camera's slow drift behind the main menu (Esc). No frame callback while the menu is closed. */}
         <GameMenuCameraDrift />
         {/* The selected agent's effect and right-click-to-send. Nothing mounted while no agent is selected. */}
@@ -2198,6 +2202,7 @@ export default function Scene() {
 
       {/* ─═̷─═̷─⚡ FPS DISPLAY ─═̷─═̷─⚡ */}
       <FPSDisplay enabled={settings.fpsCounterEnabled} fontSize={settings.fpsCounterFontSize} />
+      <AwayOverlay />
 
       {/* ─═̷─═̷─🎯 CROSSHAIR — Noclip + TPS when pointer locked (desktop) OR
           always on mobile in those modes, since mobile can't pointer-lock but
@@ -2671,9 +2676,9 @@ function SettingsMenu({ children, opacity }: { children: React.ReactNode; opacit
         <div
           data-ui-panel
           data-rail-menu="settings"
-          className="fixed bottom-4 left-[10.25rem] top-4 z-[260] flex w-[min(960px,calc(100vw-11.5rem))] overflow-hidden rounded-lg border border-white/10 font-mono text-white shadow-[0_0_54px_rgba(0,0,0,0.68),0_0_38px_rgba(167,139,250,0.18)] max-[700px]:bottom-2 max-[700px]:left-2 max-[700px]:right-2 max-[700px]:top-[58px] max-[700px]:w-auto"
-          // Blur, see-through and colour from the controls in its top right (settings-look.ts).
-          style={settingsLookStyle(settingsLook)}
+          data-kit-style={settingsLook.style}
+          className="kit-panel fixed bottom-4 left-[10.25rem] top-4 z-[260] flex w-[min(960px,calc(100vw-11.5rem))] overflow-hidden text-white shadow-[0_0_54px_rgba(0,0,0,0.68)] max-[700px]:bottom-2 max-[700px]:left-2 max-[700px]:right-2 max-[700px]:top-[58px] max-[700px]:w-auto"
+          // A kit panel: the menu style, and for Glass the see-through, blur and colour, from its top right (ui-kit).
           onMouseDown={event => event.stopPropagation()}
         >
           {children}

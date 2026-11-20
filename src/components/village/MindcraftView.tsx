@@ -9,9 +9,12 @@
 // row; click it and it opens into its units of work: one per mission, one for time with agents, one
 // for just being in the Oasis. Never a row per turn.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
 import { useMindcraftLook } from './mindcraft-look'
 import { ManualTimeForm } from './ManualTimeForm'
+import { CarbonMissions } from './CarbonMissions'
+import { useKitStyle } from '@/components/ui-kit'
+import { setWorkInMindcraft } from './work-vow-client'
 import { formatClock, type MindcraftBook, type MindcraftDay, type WorkSnapshot, type WorkUnit } from '../../lib/village/work-vow'
 
 const UNIT_COLOR = { mission: '#38bdf8', agent: '#c084fc', free: '#34d399', manual: '#f59e0b' }
@@ -19,8 +22,8 @@ const UNIT_COLOR = { mission: '#38bdf8', agent: '#c084fc', free: '#34d399', manu
 export const MINDCRAFT_EVENT = 'oasis:open-mindcraft'
 
 /** Open the Mindcraft window from anywhere (a menu tile, a key, the work counter). */
-export function openMindcraft(): void {
-  window.dispatchEvent(new CustomEvent(MINDCRAFT_EVENT))
+export function openMindcraft(carbonFile?: string): void {
+  window.dispatchEvent(new CustomEvent(MINDCRAFT_EVENT, { detail: carbonFile ? { carbon: carbonFile } : {} }))
 }
 
 function dayLabel(date: string): string {
@@ -41,12 +44,10 @@ function UnitRow({ unit, date, onRemoveManual }: { unit: WorkUnit; date: string;
         <span className="mt-[7px] h-2 w-2 shrink-0 rounded-full" style={{ background: UNIT_COLOR[unit.kind] }} />
         <span className="min-w-0 flex-1 break-words">
           {foldable ? (open ? '▾ ' : '▸ ') : ''}{unit.label}
-          {/* An agent's XP is its minutes × its mission's priority: say which mission, and the rate. */}
+          {/* XP is time; the mission only says what the time went to. */}
           {unit.kind === 'agent' && !unit.parts && (
             <span className="text-white/55">
-              {unit.mission
-                ? <> · counted for “{unit.mission}”{typeof unit.priority === 'number' ? <> at {unit.priority} XP a minute (that mission&rsquo;s priority)</> : null}</>
-                : <> · no mission names it: hours, no XP</>}
+              {unit.mission ? <> · on “{unit.mission}”</> : <> · no mission named</>}
               {unit.split ? <> · own {hms(unit.split.own)} + helpers {hms(unit.split.helpers)}</> : null}
             </span>
           )}
@@ -118,11 +119,43 @@ function DayList({ days, today, target, empty, onRemoveManual }: { days: Mindcra
   )
 }
 
-export function MindcraftView() {
+/** The agents' missions (docs/missions), ranked: they moved here from the Zen garden's wall, which now shows his. */
+function AgentMissionBoard() {
+  const [list, setList] = useState<Array<{ file: string; title: string; column: string; state: string; who: string; priority: number | null; tldr: string }> | null>(null)
+  useEffect(() => {
+    let gone = false
+    fetch('/api/village/missions', { cache: 'no-store' })
+      .then(response => (response.ok ? response.json() : null))
+      .then((data: { missions?: typeof list } | null) => { if (!gone) setList(data?.missions || []) })
+      .catch(() => { if (!gone) setList([]) })
+    return () => { gone = true }
+  }, [])
+  if (!list?.length) return null
+  const open = list.filter(m => m.column !== 'done')
+  return (
+    <div className="mc-card flex flex-col gap-1 px-3 py-2" data-mindcraft="silicon-missions">
+      <div className="mc-strong text-[14px]">The agents&rsquo; missions ({open.length} open)</div>
+      {open.map(m => (
+        <div key={m.file} className="flex items-start gap-3 text-white/85">
+          <span className="w-[42px] shrink-0 text-right font-bold tabular-nums" style={{ color: m.column === 'doing' ? '#fbbf24' : '#7dd3fc' }}>{m.priority === null ? '—' : m.priority.toFixed(2)}</span>
+          <span className="min-w-0 flex-1 break-words">{m.title} <span className="text-white/50">· {m.state} · {m.who || 'nobody yet'}</span></span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+export function MindcraftView({ carbonFile }: { carbonFile?: string | null } = {}) {
   useMindcraftLook() // the look (textures, typefaces) lives in mindcraft-look.tsx; this file carries its class names
+  // Time in Mindcraft is work at valor 1 (the owner, 2026-11-20), wherever this view is shown.
+  useEffect(() => {
+    setWorkInMindcraft(true)
+    return () => setWorkInMindcraft(false)
+  }, [])
   const [book, setBook] = useState<MindcraftBook | null>(null)
   const [snapshot, setSnapshot] = useState<WorkSnapshot | null>(null)
-  const [tab, setTab] = useState<'you' | 'agents'>('you')
+  // Carbon: what the Oasis needs from him. Silicon: what the agents did. Today: his own time (the owner, 2026-11-20).
+  const [tab, setTab] = useState<'carbon' | 'silicon' | 'today'>('carbon')
   const [error, setError] = useState('')
 
   const load = useCallback(async () => {
@@ -159,8 +192,9 @@ export function MindcraftView() {
   if (!book || !snapshot) return <div className="p-6 text-white/50">Opening the book…</div>
 
   const tabs = [
-    { id: 'you' as const, label: 'You', sub: `${hms(book.totals.owner.seconds)} · ${book.totals.owner.xp} XP` },
-    { id: 'agents' as const, label: 'The Agents', sub: `${hms(book.totals.oasis.seconds)} · ${book.totals.oasis.xp} XP` },
+    { id: 'carbon' as const, label: 'Carbon', sub: 'your missions' },
+    { id: 'silicon' as const, label: 'Silicon', sub: `agents today ${hms(snapshot.agentHours?.today || 0)}` },
+    { id: 'today' as const, label: 'Today', sub: `you ${hms(snapshot.today.seconds)} · ${book.totals.owner.xp} XP in all` },
   ]
   const vow = snapshot.commitments[0]
   return (
@@ -191,16 +225,24 @@ export function MindcraftView() {
       </div>
       <div className="flex shrink-0 flex-wrap gap-2.5 px-1 pb-1">
         {tabs.map(item => (
-          <button key={item.id} type="button" onClick={() => setTab(item.id)} className="mc-tab" style={{ minWidth: 260 }} data-on={tab === item.id ? '1' : '0'}>
+          <button key={item.id} type="button" onClick={() => setTab(item.id)} className="mc-tab" style={{ minWidth: 220 }} data-on={tab === item.id ? '1' : '0'}>
             <div>{item.label}</div>
             <div>{item.sub}</div>
           </button>
         ))}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-        {tab === 'you' && <DayList days={book.owner} today={snapshot.date} target={snapshot.targetSeconds} onRemoveManual={removeManual} empty="Nothing counted yet. Time counts while the Oasis is in front and you are doing something." />}
-        {tab === 'agents' && (
+      {/* Carbon fills the space and scrolls inside its own list; the other tabs scroll here. */}
+      <div className={`min-h-0 flex-1 pr-1 ${tab === 'carbon' ? 'flex flex-col' : 'overflow-y-auto'}`}>
+        {tab === 'carbon' && <CarbonMissions key={carbonFile || ''} initialFile={carbonFile || null} />}
+        {tab === 'today' && <DayList days={book.owner} today={snapshot.date} target={snapshot.targetSeconds} onRemoveManual={removeManual} empty="Nothing counted yet. Time counts while the Oasis is in front and you are doing something." />}
+        {tab === 'silicon' && (
           <div className="flex flex-col gap-3">
+            {snapshot.agentHours && (
+              <div className="mc-card px-3 py-2 text-[14px] leading-snug">
+                <div className="mc-strong">The Oasis worked {hms(snapshot.agentHours.today)} today{snapshot.agentHours.mark ? `: ${snapshot.agentHours.mark}` : ''} · yesterday {hms(snapshot.agentHours.yesterday)}</div>
+                <div className="text-white/60">24 h of agent work in a day: alive · 72 h: superalive · 168 h: uploaded. An agent-hour is time inside an agent&rsquo;s turns (minus time it only waited on its helpers) plus its helpers&rsquo; time; time between turns doesn&rsquo;t count. Helpers working at once each count.</div>
+              </div>
+            )}
             {book.agents.length > 0 && (
               <div className="mc-card flex flex-col gap-1 px-3 py-2">
                 <div className="mc-strong text-[14px]">All days: who worked longest</div>
@@ -210,10 +252,11 @@ export function MindcraftView() {
               </div>
             )}
             <DayList days={book.oasis} today={snapshot.date} target={null} empty="No agent has finished a turn yet while an Oasis page was listening." />
+            <AgentMissionBoard />
           </div>
         )}
       </div>
-      {tab === 'you' && (
+      {tab === 'today' && (
         <ManualTimeForm
           today={snapshot.date}
           targetSeconds={snapshot.targetSeconds}
@@ -221,18 +264,66 @@ export function MindcraftView() {
           onSaved={() => { void load() }}
         />
       )}
-      <div className="mc-foot shrink-0 pt-2 leading-snug" style={{ fontSize: 21 }}>
-        Hours are the main number. You earn 1 XP a minute with an agent or a mission open, {snapshot.settings.freeValor} with nothing open; an agent earns its minutes × its mission&rsquo;s priority. A day runs from {snapshot.settings.dayStartsAt} to {snapshot.settings.dayStartsAt}.
+      <div className="mc-foot shrink-0 pt-2 leading-snug" style={{ fontSize: 16, display: tab === 'carbon' ? 'none' : undefined }}>
+        Hours are the main number, and XP is time: 1 XP a minute of work, for you and for every agent; 0.7 only for time in the world with nothing in focus. A mission&rsquo;s priority decides what comes next, not what it pays. A day runs from {snapshot.settings.dayStartsAt} to {snapshot.settings.dayStartsAt}.
       </div>
     </div>
   )
 }
 
+const WINDOW_Z = 9395
+// Nearly full screen (the owner: "honestly, that could be full screen somehow"), between the always-on buttons.
+const WINDOW_MAX_WIDTH = 1500
+const WINDOW_GAP = 12
+
+/**
+ * Where the window may stand: between the always-on overlays that sit above it (the game rail on the
+ * left, the key hints on the right), so it opens beside them, never under them (the owner, 2026-11-20).
+ * Measured from the page, so a restyled rail or a phone layout needs no change here.
+ */
+export function clearBand(viewportWidth: number, obstacles: Array<{ left: number; right: number }>): { left: number; right: number } {
+  let left = 0
+  let right = viewportWidth
+  for (const box of obstacles) {
+    const middle = (box.left + box.right) / 2
+    if (middle < viewportWidth / 2) left = Math.max(left, box.right)
+    else right = Math.min(right, box.left)
+  }
+  // Too narrow beside them (a phone): use the whole width; the window then covers the rail, as before.
+  if (right - left < 360) return { left: 0, right: viewportWidth }
+  return { left, right }
+}
+
+/** Fixed, narrow overlays at an edge that stand above `minZ` (the game rail, the key hints). */
+export function overlayObstacles(minZ = WINDOW_Z, ignore = '[data-ui-panel="mindcraft"]'): Array<{ left: number; right: number }> {
+  const out: Array<{ left: number; right: number }> = []
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  for (const el of Array.from(document.body.querySelectorAll<HTMLElement>('body *'))) {
+    const style = getComputedStyle(el)
+    if (style.position !== 'fixed' || style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) continue
+    const z = Number.parseInt(style.zIndex, 10)
+    if (!Number.isFinite(z) || z <= minZ) continue
+    if (el.closest(ignore)) continue
+    const box = el.getBoundingClientRect()
+    // Edge overlays only: narrow, inside the window's height band, not full-screen layers or bars.
+    if (box.width <= 0 || box.height <= 0 || box.width > vw * 0.4 || box.bottom < vh * 0.05 || box.top > vh * 0.95) continue
+    out.push({ left: box.left, right: box.right })
+  }
+  return out
+}
+
 /** The view as a window over the world. Esc or a click outside closes it. */
 export function MindcraftWindow() {
+  const kitStyle = useKitStyle()
   const [open, setOpen] = useState(false)
+  const [carbonFile, setCarbonFile] = useState<string | null>(null)
   useEffect(() => {
-    const onOpen = () => setOpen(true)
+    const onOpen = (event: Event) => {
+      const file = (event as CustomEvent<{ carbon?: string }>).detail?.carbon
+      setCarbonFile(typeof file === 'string' ? file : null)
+      setOpen(true)
+    }
     window.addEventListener(MINDCRAFT_EVENT, onOpen)
     return () => window.removeEventListener(MINDCRAFT_EVENT, onOpen)
   }, [])
@@ -246,17 +337,36 @@ export function MindcraftWindow() {
     window.addEventListener('keydown', onKey, { capture: true })
     return () => window.removeEventListener('keydown', onKey, { capture: true })
   }, [open])
+  // Beside the always-on buttons, not under them: measured on open and on every resize.
+  const [band, setBand] = useState<{ left: number; right: number } | null>(null)
+  useLayoutEffect(() => {
+    if (!open) return
+    const measure = () => setBand(clearBand(window.innerWidth, overlayObstacles()))
+    measure()
+    const late = window.setTimeout(measure, 300) // overlays that settle after the first paint
+    window.addEventListener('resize', measure)
+    return () => {
+      window.clearTimeout(late)
+      window.removeEventListener('resize', measure)
+    }
+  }, [open])
   if (!open) return null
+  const vw = typeof window === 'undefined' ? 1280 : window.innerWidth
+  const area = band || { left: 0, right: vw }
+  const width = Math.max(0, Math.min(WINDOW_MAX_WIDTH, area.right - area.left - WINDOW_GAP * 2))
+  const left = area.left + (area.right - area.left - width) / 2
   return (
     <>
       <div className="fixed inset-0 z-[9390] bg-slate-950/70 backdrop-blur-sm" onClick={() => setOpen(false)} />
       <div
         data-ui-panel="mindcraft"
-        data-jewels="1"
-        className="oasis-frame fixed left-1/2 top-[5%] z-[9395] flex h-[90%] w-[min(900px,calc(100vw-32px))] -translate-x-1/2 flex-col px-2 pb-1 pt-0"
+        // A kit panel (Hipster's UI kit), so the one menu-style switch reaches Mindcraft too.
+        data-kit-style={kitStyle}
+        className="kit-panel fixed top-[5%] z-[9395] flex h-[90%] flex-col px-2 pb-1 pt-0"
+        style={{ left, width }}
       >
         <button type="button" onClick={() => setOpen(false)} title="Close (Esc)" className="mc-scope absolute right-1 top-1 z-10"><span className="mc-close flex items-center justify-center">✕</span></button>
-        <MindcraftView />
+        <MindcraftView carbonFile={carbonFile} />
       </div>
     </>
   )

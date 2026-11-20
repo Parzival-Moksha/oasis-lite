@@ -11,6 +11,8 @@ import { canRequestFullscreen, isFullscreenActive, setOasisFullscreen } from '@/
 import { setGraphicsPref, type FlopSaverMode, type GroundSharpness, type ShadowMode, type ShadowQuality, type ShadowRefresh } from '@/lib/graphics-prefs'
 import { useSavedGraphicsPrefs } from '@/lib/use-graphics-prefs'
 import { useFlopCaps } from '@/lib/use-flop-caps'
+import { restNow } from '@/lib/away-mode'
+import { KitButton, KitSelectField, KitToggle } from '@/components/ui-kit'
 
 function Choice<T extends string | number>({ label, hint, value, options, name, onChange }: {
   label: string
@@ -87,37 +89,9 @@ const SHADOW_HINT: Record<ShadowMode, string> = {
   all: 'World objects cast shadows too. Costs the most per frame.',
 }
 
-function Toggle({
-  label,
-  active,
-  onChange,
-  accent = 'bg-purple-600',
-}: {
-  label: string
-  active: boolean
-  onChange: () => void
-  accent?: string
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={active}
-      onClick={onChange}
-      className="flex w-full items-center gap-3 py-1.5 text-left cursor-pointer group hover:bg-white/5 rounded px-1 -mx-1 transition-colors"
-    >
-      <div
-        className={`w-10 h-5 rounded-full transition-all cursor-pointer relative flex-shrink-0 ${
-          active ? `${accent} shadow-lg shadow-purple-500/30` : 'bg-gray-700'
-        }`}
-      >
-        <div className={`w-4 h-4 rounded-full bg-white mt-0.5 transition-all ${
-          active ? 'translate-x-5' : 'translate-x-0.5'
-        }`} />
-      </div>
-      <span className="text-sm text-gray-300 group-hover:text-white transition-colors whitespace-nowrap">{label}</span>
-    </button>
-  )
+/** An on/off row: the kit switch (the design picked in Settings > Experiments > Switches). */
+function Toggle({ label, active, onChange }: { label: string; active: boolean; onChange: () => void; accent?: string }) {
+  return <KitToggle checked={active} onChange={onChange} label={label} data-setting-switch={label} />
 }
 
 function Slider({
@@ -248,6 +222,21 @@ export function GraphicsTab({ menuOpacity, onMenuOpacityChange }: SharedTabProps
           hint={`${FLOP_HINT[graphics.flopSaver]}${flop.level > 0 ? ` Now at tier ${flop.level} of 5: some effects below are held down.` : ''}`}
           onChange={value => setGraphicsPref('flopSaver', value)}
         />
+        <div className="flex items-end gap-2 py-1.5">
+          <div className="flex-1">
+            <KitSelectField
+              label="Rest when away"
+              hint="With no mouse or key for this long, or with the window hidden or covered, the 3D world stops drawing (no graphics card or processor spent on it). Sounds, replies and the chime keep going. Any move wakes it."
+              value={String(graphics.restAfter)}
+              options={[
+                { value: '1', label: 'After 1 minute' }, { value: '3', label: 'After 3 minutes' }, { value: '5', label: 'After 5 minutes' },
+                { value: '10', label: 'After 10 minutes' }, { value: '0', label: 'Only when hidden or on F8' },
+              ]}
+              onChange={event => setGraphicsPref('restAfter', Number(event.target.value) as 0 | 1 | 3 | 5 | 10)}
+            />
+          </div>
+          <KitButton onClick={() => restNow()} title="Stops drawing until you move (F8 does the same)">Rest now (F8)</KitButton>
+        </div>
         <Choice
           label="Ground sharpness"
           name="groundSharpness"

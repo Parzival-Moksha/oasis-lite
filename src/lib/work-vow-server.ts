@@ -18,6 +18,8 @@ import {
   daySummary,
   localDay,
   mindcraftBook,
+  agentHoursHistory,
+  type AgentHoursDay,
   missionTimers,
   emptyWorkFile,
   formatClock,
@@ -116,6 +118,11 @@ export function foldedOwnerXp(currentOldXp: number, now = Date.now()): Promise<{
   })
 }
 
+/** The Oasis's own working hours, one line per day, oldest first (the curve). */
+export function workAgentHours(): Promise<AgentHoursDay[]> {
+  return serial(async () => agentHoursHistory(await readBook()))
+}
+
 /** Per mission: the owner's time and the agents' time, over every day. */
 export function workMissionTimers(): Promise<Record<string, { ownerSeconds: number; agentSeconds: number }>> {
   return serial(async () => missionTimers(await readBook()))
@@ -179,10 +186,12 @@ async function allMissions(now: number): Promise<Mission[]> {
 }
 
 /** Finished turns and helpers, from the page that heard the engine say so. */
-export function reportAgentWork(reports: AgentWorkReport[]): Promise<{ booked: number }> {
+export function reportAgentWork(reports: AgentWorkReport[], fromEngine = false): Promise<{ booked: number }> {
   return serial(async () => {
     const before = await readBook()
     let book = before
+    // The engine reports (an empty heartbeat too): pages stop relaying while it does.
+    if (fromEngine) book = { ...book, engineReportAt: Date.now() }
     let booked = 0
     const missions = reports.length ? await allMissions(Date.now()) : []
     for (const report of reports.slice(0, 200)) {
@@ -199,10 +208,10 @@ export function reportAgentWork(reports: AgentWorkReport[]): Promise<{ booked: n
   })
 }
 
-export function reportWorkBeat(input: Omit<WorkBeat, 'focus'> & { release?: boolean; focus?: { agent?: { key: string; name: string } | null; mission?: string | null } }, now = Date.now()): Promise<{ counting: boolean; credited: number; otherTab: boolean; other?: { client?: string; since: number }; snapshot: WorkSnapshot }> {
+export function reportWorkBeat(input: Omit<WorkBeat, 'focus'> & { release?: boolean; focus?: { agent?: { key: string; name: string } | null; mission?: string | null; mindcraft?: boolean } }, now = Date.now()): Promise<{ counting: boolean; credited: number; otherTab: boolean; other?: { client?: string; since: number }; snapshot: WorkSnapshot }> {
   return serial(async () => {
     const mission = input.focus?.mission ? await missionMeta(input.focus.mission) : null
-    const beat: WorkBeat & { release?: boolean } = { ...input, focus: { agent: input.focus?.agent || null, mission } }
+    const beat: WorkBeat & { release?: boolean } = { ...input, focus: { agent: input.focus?.agent || null, mission, mindcraft: input.focus?.mindcraft === true } }
     const before = await readBook()
     const result = applyWorkBeat(before, beat, now)
     // A closing page reports its last seconds and lets go.

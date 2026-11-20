@@ -697,7 +697,7 @@ export class HermesAgent {
     this.inFlight.add(uuid);
     if (scheduled) this.scheduledPending = uuid;
     else if (this.scheduledRun || this.scheduledPending) this.scheduledMixed = true;
-    const run = this.sendChain.then(() => this.sendNow(text || '', { uuid, voice, images: pictures, scheduled }));
+    const run = this.sendChain.then(() => this.sendNow(text || '', { uuid, priority, voice, images: pictures, scheduled }));
     this.sendChain = run.then(() => { this.inFlight.delete(uuid); }, () => {
       this.inFlight.delete(uuid);
       if (!this.hub.stopping?.()) this.hub.journal?.done(this.id, uuid);
@@ -738,7 +738,8 @@ export class HermesAgent {
   }
 
   /** Into the queue; it goes to Hermes when the session is open and no turn runs (pump). */
-  async deliver(text, { uuid = randomUUID(), voice, images = [], resume = false, scheduled = null } = {}) {
+  /** priority "now" (the composer's Urgent): a running turn is cancelled and this goes out next, as Claude Code does. */
+  async deliver(text, { uuid = randomUUID(), priority, voice, images = [], resume = false, scheduled = null } = {}) {
     if (!this.proc) throw new Error(this.statusReason || 'agent process not running');
     let picture = null;
     if (this.eyes && this.hub.eyes && !resume && !scheduled) {
@@ -750,13 +751,19 @@ export class HermesAgent {
     this.pendingUser.set(uuid, { text, sentAt: Date.now(), turnWasRunning, turnIndex: this.turnIndex });
     this.queue.push({ uuid, text, images, picture, resume, scheduled });
     const shown = images.map((p) => ({ fileId: p.fileId, name: p.name, mediaType: p.mediaType }));
-    this.emit('user.sent', { uuid, text, midTurn: turnWasRunning, priority: 'next', ...(picture?.data ? { eyes: true } : {}), ...(voice ? { voice } : {}), ...(shown.length ? { images: shown } : {}), ...(resume ? { auto: 'resume' } : {}), ...(scheduled ? { auto: 'schedule', scheduled: scheduled.label || 'scheduled' } : {}) });
+    const urgent = priority === 'now' && this.turnRunning;
+    this.emit('user.sent', { uuid, text, midTurn: turnWasRunning, priority: urgent ? 'now' : 'next', ...(picture?.data ? { eyes: true } : {}), ...(voice ? { voice } : {}), ...(shown.length ? { images: shown } : {}), ...(resume ? { auto: 'resume' } : {}), ...(scheduled ? { auto: 'schedule', scheduled: scheduled.label || 'scheduled' } : {}) });
     if (resume) {
       this.resumedAt = Date.now();
       this.emit('notice', { subtype: 'resumed', text: 'The engine restarted while this agent was working: it was told to carry on.' });
     }
     if (this.permissions.size) this.recomputeStatus();
-    else this.setStatus(STATUS.WORKING, resume ? RESUMED_REASON : scheduled ? 'woke up on its schedule' : turnWasRunning ? 'message queued for the next turn' : 'message sent');
+    else this.setStatus(STATUS.WORKING, resume ? RESUMED_REASON : scheduled ? 'woke up on its schedule' : urgent ? 'urgent: stopping its turn to read this' : turnWasRunning ? 'message queued for the next turn' : 'message sent');
+    // Urgent: stop the running turn (the prompt resolves "cancelled", endTurn pumps the queue, this goes out next).
+    if (urgent) {
+      this.interrupted = true;
+      try { this.notify('session/cancel', { sessionId: this.sessionId }); } catch { /* the turn ends on its own; this still goes out next */ }
+    }
     this.pump();
     return { uuid, midTurn: turnWasRunning };
   }

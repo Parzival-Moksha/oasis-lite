@@ -237,6 +237,7 @@ export class Agent {
     // agent's own shell); the CLI login drops any inherited one. Every account out: the one that comes back first.
     const account = this.hub.chooseAccount ? this.hub.chooseAccount(this) : null;
     this.accountId = account?.id || null;
+    this.noteChrome(account);
     const env = { CLAUDE_CODE_ATTACHMENTS_BY_PATH: '1', OASIS_AGENT_ID: this.id, ...(this.hub.url ? { OASIS_ENGINE_URL: this.hub.url } : {}), ...(account && this.hub.accountEnv ? this.hub.accountEnv(account.id) : {}) };
     // Scratch agents live inside the 7c_oasis repo: keep them off the owner's auto-memory.
     if (path.resolve(this.cwd).toLowerCase().startsWith(SANDBOX_ROOT.toLowerCase())) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';
@@ -450,6 +451,8 @@ export class Agent {
   afterResult() {
     this.turnRunning = false;
     this.turnOpenAt = null;
+    // When its prompt cache was last warm: an agent idle an hour moves between accounts for free (accounts.js choose).
+    this.lastTurnAt = this.hub.now ? this.hub.now() : Date.now();
     this.resumedAt = null;
     this.scheduledRun = false;
     this.scheduledMixed = false;
@@ -556,7 +559,7 @@ export class Agent {
     // Its process runs on an account it should no longer use (out, or the village went back to the first): switch first.
     if (this.proc && this.hub.chooseAccount) {
       const want = this.hub.chooseAccount(this);
-      if (want && want.id !== this.accountId) await this.switchAccount(`moving to ${want.label}`);
+      if (want && want.id !== this.accountId) await this.switchAccount(want.why ? `moving to ${want.label}: ${want.why}` : `moving to ${want.label}`);
     }
     if (!this.proc) {
       this.start();
@@ -582,10 +585,32 @@ export class Agent {
     }
     this.start();
     if (this.accountId !== from) {
+      if (from) this.accountMovedAt = this.hub.now ? this.hub.now() : Date.now();
       this.hub.log(`[${this.name}] account: ${from || 'none'} -> ${this.accountId || 'none'}${why ? ` (${why})` : ''}`);
       this.emit('account', { from, to: this.accountId, why });
     }
     return this.accountId;
+  }
+
+  /**
+   * Claude in Chrome on, but this session runs on a token account, where Chrome tools do not exist (tested 19 Nov,
+   * account-failover.md): it happens only while the full login is out (accounts.js keeps Chrome agents there). The
+   * agent and the owner are told once, and again when it is back on the full login, instead of the tools just vanishing.
+   */
+  noteChrome(account) {
+    const off = Boolean(this.chrome && account && account.id !== CLI);
+    if (off && this.chromeOffOn !== account.id) {
+      this.chromeOffOn = account.id;
+      const label = this.hub.accountLabel ? this.hub.accountLabel(account.id) : account.id;
+      const back = this.hub.accountBackAt ? this.hub.accountBackAt(CLI) : null;
+      const when = back ? ` until about ${new Date(back).toTimeString().slice(0, 5)}` : '';
+      this.chromeNote = `[Oasis account: Claude in Chrome is not available in this session for now. It runs on ${label}, a token account, and Chrome tools only exist on the full login, which is out of usage${when}. Leave the browser work for later or say what you need from it; Chrome comes back by itself when the full login has usage again.]`;
+      this.emit('notice', { subtype: 'accounts', text: `Claude in Chrome is off while this agent runs on ${label}: Chrome tools only exist on the full login, which is out of usage${when}. It moves back by itself when that login has usage again.` });
+    } else if (!off && this.chromeOffOn) {
+      this.chromeOffOn = null;
+      this.chromeNote = this.chrome ? '[Oasis account: Claude in Chrome is available again: this session runs on the full login.]' : null;
+      if (this.chrome) this.emit('notice', { subtype: 'accounts', text: 'Claude in Chrome is back: this agent runs on the full login again.' });
+    }
   }
 
   /** Every account is out: wait (status error with the time), and go on when the engine says one is back. */
@@ -708,6 +733,11 @@ export class Agent {
         this.youDue = false;
         this.youStamp = you.stamp;
       }
+    }
+    // Claude in Chrome off or back because of its account (noteChrome): said once, with the next message.
+    if (!command && !resume && this.chromeNote) {
+      content = [...(Array.isArray(content) ? content : [{ type: 'text', text }]), { type: 'text', text: this.chromeNote }];
+      this.chromeNote = null;
     }
     // Once: a voiced agent that has no voice of its own yet learns how to pick one.
     if (voiceNote === VOICE_NOTE && !this.voiceChoice && !this.voiceOffered) {
@@ -834,7 +864,13 @@ export class Agent {
     return { ok: true, data: { eyes: this.eyes } };
   }
 
-  async setPermissionMode(mode) {
+  /**
+   * restart: the owner confirmed (index.js only passes it from an Oasis page's socket). A running CLI refuses some
+   * switches (bypassPermissions when it was not started with it: "the session was not launched with dangerously
+   * skip permissions"); then it is restarted in that mode with the same session, like the Chrome switch: now when
+   * idle, else after this turn. Without restart a refusal comes back with needsRestart, so the page can ask first.
+   */
+  async setPermissionMode(mode, { restart = false } = {}) {
     // `mode` events trigger a snapshot (index.js), so every client's picker follows the change.
     if (!this.proc) { this.permissionMode = mode; this.persist(); this.emit('mode', { permissionMode: mode, applied: 'on next start' }); return { ok: true }; }
     const r = await this.request('set_permission_mode', { mode });
@@ -843,8 +879,17 @@ export class Agent {
       this.effectivePermissionMode = mode;
       this.persist();
       this.emit('mode', { permissionMode: mode });
+      return r;
     }
-    return r;
+    if (!restart) return { ...r, needsRestart: true };
+    this.permissionMode = mode;
+    this.persist();
+    this.restartPending = true;
+    let applied = 'after this turn';
+    if (!(this.turnRunning || this.pendingUser.size)) { applied = 'now'; this.kill(); }
+    this.hub.log(`[${this.name}] mode ${mode}: restarting with the same session (${applied}); the running CLI said: ${r.error || 'no'}`);
+    this.emit('mode', { permissionMode: mode, applied });
+    return { ok: true, data: { permissionMode: mode, applied, restarted: true } };
   }
 
   /**

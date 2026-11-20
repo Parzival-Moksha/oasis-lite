@@ -1,22 +1,49 @@
 // ░▒▓ VILLAGE KEYS — what a key press means in the village (pure, so it can be tested) ▓▒░
 //
-// Next to an agent: T opens its talk window with the mic on, E opens it quietly (to write), F opens it
-// straight on its full screen.
-// With an agent open (side panel or its screen, the text box not focused): T starts / stops the mic,
-// Enter sends what is in the box, F zooms onto its screen and back, Esc leaves the screen (one more Esc
-// leaves the agent, through the input manager; a screen opened with F straight from the world leaves in one).
-// Esc never stops the mic: dictation goes on after leaving (the voice widget, bottom left). Mouse-look comes
-// back with a click on the scene.
-// N jumps to the next agent that needs you. In the summoning circle E opens the picker.
+// An agent has two views: its side panel (E) and its full screen (F). Which one is open, and what E, F and Esc do,
+// is decided in one place, VILLAGE_VIEW_TABLE below (the owner, 2026-11-20 18:40: "make it one small state machine"):
+//
+//                   E                     F                      Esc
+//   nothing open    E panel of the agent  F view of the agent    (the world's: the menu)
+//   E panel open    nothing open          F view, same agent     nothing open
+//   F view open     E panel, same agent   nothing open           nothing open
+//
+// "The agent" from nothing open: the one selected (clicked), else the nearest. The panel's "F screen" button and the
+// full screen's "E panel" and close buttons press the same keys (village-actions.ts pressVillageView).
+// Other keys: T next to an agent opens it with the mic on, and toggles the mic with one open; Enter sends what is in
+// the box; N jumps to the next agent that needs you; E in the summoning circle opens the picker. Keys typed into a
+// text box are text (Ctrl+Space excepted: it dictates). Esc never stops the mic: dictation goes on after leaving
+// (the voice widget, bottom left).
+
+export type VillageView = { kind: 'none' } | { kind: 'panel' | 'screen'; agentId: string }
+export type VillageViewKey = 'E' | 'F' | 'Esc'
+export const VILLAGE_VIEW_NONE: VillageView = { kind: 'none' }
+
+/** The single place that decides: from each view, where each of E, F and Esc goes. */
+export const VILLAGE_VIEW_TABLE: Record<VillageView['kind'], Record<VillageViewKey, VillageView['kind']>> = {
+  none: { E: 'panel', F: 'screen', Esc: 'none' },
+  panel: { E: 'none', F: 'screen', Esc: 'none' },
+  screen: { E: 'panel', F: 'none', Esc: 'none' },
+}
+
+/** Where `key` goes from `view`. `target`: the agent to open from nothing open (selected, else nearest). */
+export function nextVillageView(view: VillageView, key: VillageViewKey, target: string | null): VillageView {
+  const kind = VILLAGE_VIEW_TABLE[view.kind][key]
+  if (kind === 'none') return VILLAGE_VIEW_NONE
+  const agentId = view.kind === 'none' ? target : view.agentId
+  return agentId ? { kind, agentId } : VILLAGE_VIEW_NONE
+}
+
+export function villageViewKey(code: string): VillageViewKey | null {
+  return code === 'KeyE' ? 'E' : code === 'KeyF' ? 'F' : code === 'Escape' ? 'Esc' : null
+}
 
 export type VillageKeyAction =
   | 'toggle-voice'
-  | 'toggle-screen'
+  /** E, F or Esc: the view table decides (nextVillageView). */
+  | 'view'
   | 'send'
-  | 'escape'
   | 'talk'
-  | 'open'
-  | 'screen'
   | 'picker'
   | 'next'
 
@@ -31,6 +58,8 @@ export interface VillageKeyContext {
   typing: boolean
   focusedAgentId: string | null
   nearbyAgentId: string | null
+  /** The agent E and F open from nothing open: the selected one, else the nearest. */
+  targetAgentId?: string | null
   /** The world's keys are free for the village (walking around, or already in the session view). */
   worldKeysFree: boolean
   inPlaza: boolean
@@ -43,17 +72,16 @@ export function villageKeyAction(c: VillageKeyContext): VillageKeyAction | null 
   if (c.ctrl || c.meta || c.alt || c.repeat || c.typing) return null
   if (c.focusedAgentId) {
     if (c.code === 'KeyT') return 'toggle-voice'
-    if (c.code === 'KeyF') return 'toggle-screen'
+    if (villageViewKey(c.code)) return 'view'
     if (c.code === 'Enter' && !c.shift) return 'send'
-    if (c.code === 'Escape') return 'escape'
   }
   // Placement, paint and other panels keep their keys (E is noclip "down", T the rotate gizmo).
   if (!c.worldKeysFree) return null
-  if (c.code === 'KeyE' || c.code === 'KeyT' || c.code === 'KeyF') {
-    const target = c.nearbyAgentId
-    if (!target) return c.code === 'KeyE' && c.inPlaza && !c.focusedAgentId ? 'picker' : null
-    if (target === c.focusedAgentId) return null
-    return c.code === 'KeyT' ? 'talk' : c.code === 'KeyE' ? 'open' : 'screen'
+  if (c.code === 'KeyT') return c.nearbyAgentId && c.nearbyAgentId !== c.focusedAgentId ? 'talk' : null
+  if (c.code === 'KeyE' || c.code === 'KeyF') {
+    if (c.focusedAgentId) return null
+    if (c.targetAgentId ?? c.nearbyAgentId) return 'view'
+    return c.code === 'KeyE' && c.inPlaza ? 'picker' : null
   }
   if (c.code === 'KeyN' && !c.shift) return c.agentCount > 0 ? 'next' : null
   return null

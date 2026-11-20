@@ -30,6 +30,7 @@ import { VILLAGE_FONT_BODY, VILLAGE_TYPE_CLASS } from './village-status'
 import { showNotice } from '../forge/GlobalNotice'
 import { canInterrupt } from '../../lib/village/village-interrupt'
 import { VoiceMessageButton } from './VoiceMessage'
+import { KitToggle } from '@/components/ui-kit'
 import { getVoiceTypingEngine } from '../../lib/voice/voice-typing-engine'
 import { PictureChips, useComposerPictures } from './ComposerPictures'
 import { subscribeVillageSend, subscribeVillageVoiceStop, subscribeVillageVoiceToggle, takeVillageVoiceRequest } from './village-actions'
@@ -56,6 +57,20 @@ function useViewportHeight(): number {
   return height
 }
 
+/**
+ * What the urgent switch does, in plain words (the owner asked, 2026-11-20). Measured on the engine with an agent
+ * running six slow steps (2026-11-20): urgent stopped the running turn at once and the reply came as a new turn, the
+ * remaining steps did not run, for Claude Code (priority "now") and for Hermes (session/cancel, hermes.js). Off:
+ * Claude Code took the message in after the step it was on and went on in the same turn; Hermes only after its whole
+ * turn was over.
+ */
+function urgentHelp(hermes: boolean): string {
+  return `Urgent: it stops what it is doing and answers this right away; the rest of that task is dropped unless you tell it to go on.
+Off: ${hermes
+    ? 'it reads this when it has finished what it is doing.'
+    : 'it reads this after the step it is on, and carries on.'}`
+}
+
 export function VillageComposer({ agentId, large = false, containerHeight }: {
   agentId: string
   /** On the agent's screen (F): bigger type. */
@@ -67,6 +82,7 @@ export function VillageComposer({ agentId, large = false, containerHeight }: {
   const pendingUser = useOasisStore(s => s.agentEngine.agents[agentId]?.pendingUser || 0)
   // A desktop-app session reached through the Oasis plugin: the app owns interrupt and priorities.
   const owned = useOasisStore(s => Boolean(s.agentEngine.agents[agentId]?.owned))
+  const hermes = useOasisStore(s => s.agentEngine.agents[agentId]?.runtime === 'hermes')
   // Only while a turn runs (village-interrupt.ts): not for a finished agent with a leftover status.
   const interruptible = useOasisStore(s => canInterrupt(s.agentEngine.agents[agentId]))
   const dictation = useVillageDictation(agentId)
@@ -288,10 +304,9 @@ export function VillageComposer({ agentId, large = false, containerHeight }: {
       )}
       <div className="flex flex-wrap items-center justify-between gap-2">
         {owned ? (
-          <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-white/75" title='priority "now": stop at the next model request and answer this'>
-            <input type="checkbox" checked={urgent} onChange={event => setUrgent(event.target.checked)} className="accent-amber-400" />
-            urgent
-          </label>
+          <span data-urgent-help title={urgentHelp(hermes)}>
+            <KitToggle checked={urgent} onChange={setUrgent} label="urgent" accent="#fbbf24" data-composer-urgent={urgent ? 'on' : 'off'} />
+          </span>
         ) : <span />}
         <div className="flex items-center gap-1.5">
           {pendingUser > 0 && <span className="text-[10.5px] text-white/70">{pendingUser} queued</span>}
@@ -320,8 +335,8 @@ export function VillageComposer({ agentId, large = false, containerHeight }: {
       </div>
       <div className="text-[9.5px] uppercase tracking-[0.12em] text-white/55 max-[700px]:hidden">
         {large
-          ? 'T talk, T again to stop · Enter send · click the box to type · F or Esc back to the side panel · N next agent'
-          : 'T talk, T again to stop · Enter send · click the box to type · F zoom into the screen · Esc back · N next agent'}
+          ? 'T talk, T again to stop · Enter send · click the box to type · E side panel · F or Esc close · N next agent'
+          : 'T talk, T again to stop · Enter send · click the box to type · F full screen · E or Esc close · N next agent'}
       </div>
     </div>
   )

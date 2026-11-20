@@ -130,8 +130,14 @@ export function createDragTracker() {
       swallowClick = false
     },
     /** Returns the turn to apply (0, 0 while a left press has not moved far enough yet). */
-    move(event: { clientX: number; clientY: number; movementX: number; movementY: number; pointerId: number }): { x: number; y: number } {
+    move(event: { clientX: number; clientY: number; movementX: number; movementY: number; pointerId: number; buttons?: number }): { x: number; y: number } {
       if (!active || event.pointerId !== active.pointerId) return { x: 0, y: 0 }
+      // No button held any more: the release happened where we could not see it (outside the window,
+      // while it lost focus). End the drag instead of turning on every later move (it spun the camera).
+      if (event.buttons === 0) {
+        active = null
+        return { x: 0, y: 0 }
+      }
       if (!active.looking) {
         if (Math.hypot(event.clientX - active.x, event.clientY - active.y) < DRAG_START_PX) return { x: 0, y: 0 }
         active.looking = true
@@ -144,6 +150,11 @@ export function createDragTracker() {
       if (!active || event.pointerId !== active.pointerId) return
       swallowClick = active.looking && active.button === 0
       active = null
+    },
+    /** The window lost focus or was hidden mid-drag: the release will not come. */
+    cancel(): void {
+      active = null
+      swallowClick = false
     },
     /** The click after a left drag that looked: swallow it once. */
     takeSwallowClick(): boolean {
@@ -182,6 +193,10 @@ export function installDragLook(push: PushDelta, canDrag: () => boolean): () => 
     // Right-drag is the look button here: no context menu over the world.
     if (state.on && onCanvas(event)) event.preventDefault()
   }
+  const onAway = () => { tracker.cancel() }
+  const onVisibility = () => { if (document.visibilityState === 'hidden') tracker.cancel() }
+  window.addEventListener('blur', onAway)
+  document.addEventListener('visibilitychange', onVisibility)
   window.addEventListener('pointerdown', onDown, true)
   window.addEventListener('pointermove', onMove, true)
   window.addEventListener('pointerup', onUp, true)
@@ -189,6 +204,8 @@ export function installDragLook(push: PushDelta, canDrag: () => boolean): () => 
   window.addEventListener('click', onClick, true)
   window.addEventListener('contextmenu', onContextMenu, true)
   return () => {
+    window.removeEventListener('blur', onAway)
+    document.removeEventListener('visibilitychange', onVisibility)
     window.removeEventListener('pointerdown', onDown, true)
     window.removeEventListener('pointermove', onMove, true)
     window.removeEventListener('pointerup', onUp, true)

@@ -12,32 +12,16 @@ import { DESK_SCREEN_LIMIT, isDeskScreensMode, type DeskScreensMode } from '@/li
 import { isVillageSoundOn, setVillageSoundOn, subscribeVillageSound } from '@/components/village/village-sound'
 import { TAG_SIZE, TAG_STYLES, getTagSettings, getTagSettingsVersion, setTagSettings, subscribeTagSettings } from '@/lib/village/tag-style'
 import { KitTabs, KitToggle } from '@/components/ui-kit'
+import { VillageWorldRow } from '@/components/village/VillageWorldRow'
 import { LEAVE_EFFECTS, getVillageLooks, getVillageLooksVersion, setVillageLooks, subscribeVillageLooks } from '@/lib/village/village-looks'
 import { isVillageVoiceOn, setVillageVoiceOn, subscribeVillageVoice } from '@/components/village/village-companion'
 import { WakeUpSettings } from './WakeUpSettings'
 import { AccountsSettings } from './AccountsSettings'
 import { ServicesSettings } from './ServicesSettings'
 
-/** An on/off row: a switch, a title and a line on what it does now. */
+/** An on/off row: the kit switch (the design picked in Settings > Experiments > Switches), a title and a line on what it does now. */
 function SwitchRow({ on, onToggle, title, hint, data }: { on: boolean; onToggle: () => void; title: string; hint: string; data: string }) {
-  return (
-    <label className="flex items-center gap-3 py-1.5 cursor-pointer group hover:bg-white/5 rounded px-1 -mx-1 transition-colors">
-      <div
-        role="switch"
-        aria-checked={on}
-        data-setting={data}
-        data-state={on ? 'on' : 'off'}
-        onClick={onToggle}
-        className={`w-10 h-5 rounded-full transition-all cursor-pointer relative flex-shrink-0 ${on ? 'bg-cyan-600 shadow-lg shadow-cyan-500/30' : 'bg-gray-700'}`}
-      >
-        <div className={`w-4 h-4 rounded-full bg-white mt-0.5 transition-all ${on ? 'translate-x-5' : 'translate-x-0.5'}`} />
-      </div>
-      <div className="min-w-0">
-        <div className="text-sm text-gray-300 group-hover:text-white transition-colors whitespace-nowrap">{title}</div>
-        <div className="text-[10px] text-gray-500">{hint}</div>
-      </div>
-    </label>
-  )
+  return <KitToggle checked={on} onChange={onToggle} label={title} hint={hint} data-setting={data} data-state={on ? 'on' : 'off'} />
 }
 
 const DESK_SCREEN_CHOICES: Array<{ mode: DeskScreensMode; label: string; hint: string }> = [
@@ -111,6 +95,7 @@ export function AgentsTab() {
       <section>
         <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1.5 font-mono">Agents in the village</div>
         {/* The shared UI kit (components/ui-kit): its look follows Settings' style switch. */}
+        <VillageWorldRow />
         <div className="flex flex-col gap-2 py-1" data-village-looks>
           <KitToggle
             checked={looks.desks}
@@ -170,79 +155,42 @@ export function AgentsTab() {
           title="Agent voices"
           hint={voicesOn ? 'Agents with Voice on (their settings menu) say a short version of each reply out loud.' : 'Muted: nothing is spoken or generated, whatever each agent is set to.'}
         />
-        <label className="flex items-center gap-3 py-1.5 cursor-pointer group hover:bg-white/5 rounded px-1 -mx-1 transition-colors">
-          <div
-            role="switch"
-            aria-checked={settings.villageAcademy !== false}
-            data-village-academy={settings.villageAcademy !== false ? 'on' : 'off'}
-            onClick={() => updateSetting('villageAcademy', settings.villageAcademy === false)}
-            className={`w-10 h-5 rounded-full transition-all cursor-pointer relative flex-shrink-0 ${
-              settings.villageAcademy !== false ? 'bg-amber-500 shadow-lg shadow-amber-500/30' : 'bg-gray-700'
-            }`}
-          >
-            <div className={`w-4 h-4 rounded-full bg-white mt-0.5 transition-all ${
-              settings.villageAcademy !== false ? 'translate-x-5' : 'translate-x-0.5'
-            }`} />
-          </div>
-          <div className="min-w-0">
-            <div className="text-sm text-gray-300 group-hover:text-white transition-colors whitespace-nowrap">Academy</div>
-            <div className="text-[10px] text-gray-500">
-              {settings.villageAcademy !== false
-                ? 'The skill map opens with K, and agents in training are stone until they have Spirit and Body.'
-                : 'No skill map and no stone agents. Progress is kept.'}
-            </div>
-          </div>
-        </label>
+        <KitToggle
+          checked={settings.villageAcademy !== false}
+          onChange={() => updateSetting('villageAcademy', settings.villageAcademy === false)}
+          label="Academy"
+          hint={settings.villageAcademy !== false ? 'The skill map opens with K, and agents in training are stone until they have Spirit and Body.' : 'No skill map and no stone agents. Progress is kept.'}
+          data-village-academy={settings.villageAcademy !== false ? 'on' : 'off'}
+        />
         {settings.villageAcademy !== false && (
-          <label className="flex items-center gap-3 py-1.5 cursor-pointer group hover:bg-white/5 rounded px-1 -mx-1 transition-colors">
-            <div
-              role="switch"
-              aria-checked={settings.villageAcademyTree === true}
-              data-village-academy-tree={settings.villageAcademyTree === true ? 'on' : 'off'}
-              onClick={() => updateSetting('villageAcademyTree', settings.villageAcademyTree !== true)}
-              className={`w-10 h-5 rounded-full transition-all cursor-pointer relative flex-shrink-0 ${
-                settings.villageAcademyTree === true ? 'bg-amber-500 shadow-lg shadow-amber-500/30' : 'bg-gray-700'
-              }`}
-            >
-              <div className={`w-4 h-4 rounded-full bg-white mt-0.5 transition-all ${
-                settings.villageAcademyTree === true ? 'translate-x-5' : 'translate-x-0.5'
-              }`} />
-            </div>
-            <div className="min-w-0">
-              <div className="text-sm text-gray-300 group-hover:text-white transition-colors whitespace-nowrap">Skill tree in the world</div>
-              <div className="text-[10px] text-gray-500">
-                {settings.villageAcademyTree === true
-                  ? 'The tree also stands behind the spawn point, as a stair of terraces.'
-                  : 'Off: the skill map (K) is the way in.'}
-              </div>
-            </div>
-          </label>
+          <KitToggle
+            checked={settings.villageAcademyTree === true}
+            onChange={() => updateSetting('villageAcademyTree', settings.villageAcademyTree !== true)}
+            label="Skill tree in the world"
+            hint={settings.villageAcademyTree === true ? 'The tree also stands behind the spawn point, as a stair of terraces.' : 'Off: the skill map (K) is the way in.'}
+            data-village-academy-tree={settings.villageAcademyTree === true ? 'on' : 'off'}
+          />
         )}
       </section>
 
       <section className="border-t border-white/10 pt-3">
         <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1.5 font-mono">Agent Embodiment</div>
 
-        <label className="flex items-center gap-3 py-1.5 cursor-pointer group hover:bg-white/5 rounded px-1 -mx-1 transition-colors">
-          <div
-            onClick={() => updateSetting('agentActionMode', settings.agentActionMode === 'embodied' ? 'instant' : 'embodied')}
-            className={`w-10 h-5 rounded-full transition-all cursor-pointer relative flex-shrink-0 ${
-              settings.agentActionMode === 'embodied' ? 'bg-cyan-600 shadow-lg shadow-cyan-500/30' : 'bg-gray-700'
-            }`}
-          >
-            <div className={`w-4 h-4 rounded-full bg-white mt-0.5 transition-all ${
-              settings.agentActionMode === 'embodied' ? 'translate-x-5' : 'translate-x-0.5'
-            }`} />
-          </div>
-          <div className="min-w-0">
-            <div className="text-sm text-gray-300 group-hover:text-white transition-colors whitespace-nowrap">Embodied Agent Actions</div>
-            <div className="text-[10px] text-gray-500">
-              {settings.agentActionMode === 'embodied'
-                ? 'Agents walk, cast, and settle before manifestations visibly land.'
-                : 'Agent world changes apply immediately without slow-mo staging.'}
-            </div>
-          </div>
-        </label>
+        <KitToggle
+          checked={settings.agentIdleVariety !== false}
+          onChange={() => updateSetting('agentIdleVariety', settings.agentIdleVariety === false)}
+          label="Idle variety"
+          hint={settings.agentIdleVariety !== false ? 'Waiting for you: torch, spell, folded arms, sword, swim. Working: phone, fixing, chopping. Each agent takes turns in its own order.' : 'One pose each: folded arms while waiting for you, the phone while working.'}
+          data-agent-idle-variety={settings.agentIdleVariety !== false ? 'on' : 'off'}
+        />
+
+        <KitToggle
+          checked={settings.agentActionMode === 'embodied'}
+          onChange={() => updateSetting('agentActionMode', settings.agentActionMode === 'embodied' ? 'instant' : 'embodied')}
+          label="Embodied Agent Actions"
+          hint={settings.agentActionMode === 'embodied' ? 'Agents walk, cast, and settle before manifestations visibly land.' : 'Agent world changes apply immediately without slow-mo staging.'}
+          data-agent-action-mode={settings.agentActionMode === 'embodied' ? 'embodied' : 'instant'}
+        />
 
         <div className="py-1.5">
           <div className="flex items-center justify-between mb-1.5">

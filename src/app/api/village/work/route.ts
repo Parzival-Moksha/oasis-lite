@@ -20,7 +20,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 import { guardAgentRoute } from '@/lib/local-request-guard'
-import { declareAgentMission, editManualTime, reportAgentWork, reportWorkBeat, setWorkSettings, switchWorkMission, workDaySummary, workMindcraft, workMissionTimers, workVowSnapshot } from '@/lib/work-vow-server'
+import { declareAgentMission, editManualTime, reportAgentWork, reportWorkBeat, setWorkSettings, switchWorkMission, workDaySummary, workAgentHours, workMindcraft, workMissionTimers, workVowSnapshot } from '@/lib/work-vow-server'
 import { clientLabel, isAutomationRequest, type AgentWorkReport } from '@/lib/village/work-vow'
 
 export const dynamic = 'force-dynamic'
@@ -38,6 +38,8 @@ export async function GET(request: NextRequest) {
     }
     // ?mindcraft=1: every day in the book as lists (the owner's, each agent's, the whole Oasis').
     if (new URL(request.url).searchParams.get('mindcraft')) return NextResponse.json(await workMindcraft())
+    // ?agentHours=1: the agents' working hours per day, oldest first, with the mark each day reached.
+    if (new URL(request.url).searchParams.get('agentHours')) return NextResponse.json({ marks: [24, 72, 168], days: await workAgentHours() })
     // ?missions=1: per mission, the owner's time on it and the agents' time on it.
     if (new URL(request.url).searchParams.get('missions')) return NextResponse.json({ missions: await workMissionTimers() })
     return NextResponse.json(await workVowSnapshot())
@@ -88,7 +90,7 @@ export async function POST(request: NextRequest) {
       const reports = (body.agentWork as Array<Partial<AgentWorkReport>>).filter((r): r is AgentWorkReport =>
         Boolean(r) && typeof r.key === 'string' && r.key.length > 0 && r.key.length <= 120 && typeof r.ts === 'number' && typeof r.ms === 'number' && (r.kind === 'turn' || r.kind === 'helper'))
         .map(r => ({ key: r.key, name: String(r.name || r.key).slice(0, 80), ts: r.ts, kind: r.kind, ms: r.ms }))
-      return NextResponse.json({ ok: true, ...(await reportAgentWork(reports)) })
+      return NextResponse.json({ ok: true, ...(await reportAgentWork(reports, (body as { source?: unknown }).source === 'engine')) })
     }
     if ('mission' in body) {
       if (body.mission !== null && typeof body.mission !== 'string') return NextResponse.json({ error: 'mission is a file name or null' }, { status: 400 })
@@ -101,7 +103,7 @@ export async function POST(request: NextRequest) {
     const agent = body.focus?.agent && typeof body.focus.agent.key === 'string' && body.focus.agent.key
       ? { key: body.focus.agent.key.slice(0, 120), name: String(body.focus.agent.name || body.focus.agent.key).slice(0, 80) }
       : null
-    const focus = { agent, mission: typeof body.focus?.mission === 'string' ? body.focus.mission : null }
+    const focus = { agent, mission: typeof body.focus?.mission === 'string' ? body.focus.mission : null, mindcraft: (body.focus as { mindcraft?: unknown } | null)?.mindcraft === true }
     return NextResponse.json({ ok: true, ...(await reportWorkBeat({ tab: body.tab, seq: body.seq, seconds: body.seconds, release: body.release === true, back: body.back === true, focus, client: clientLabel(userAgent) })) })
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 })

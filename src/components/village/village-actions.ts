@@ -16,7 +16,7 @@ import { getCameraSnapshot } from '../../lib/camera-bridge'
 import { getPlayerAvatarPose, markThirdPersonCameraRestored, requestPlayerAvatarTeleport } from '../../lib/player-avatar-runtime'
 import { showNotice } from '../forge/GlobalNotice'
 import { findNearestStation, stationLocalToWorld, type Vec3 } from '../../lib/village/village-layout'
-import { villageKeyAction } from '../../lib/village/village-keys'
+import { villageKeyAction, VILLAGE_VIEW_NONE, nextVillageView, villageViewKey, type VillageView, type VillageViewKey } from '../../lib/village/village-keys'
 import { awayAgentWinsPrompt } from '../../lib/village/village-follow'
 import { getVillageSoundDebug } from './village-sound'
 
@@ -286,21 +286,45 @@ export function getSessionPanelGeometry(
 
 // ─── camera save / restore ──────────────────────────────────────────────────
 
+// ─── what the keys and the panels share ─────────────────────────────────────
+// On globalThis, like `places`: after a hot reload of this file the old copy (still held by a listener or a panel)
+// and the new one would each keep their own, and the keys and the panels would disagree about which view is open
+// (2026-11-20: F "did nothing", then closed everything; E and F looked swapped).
+interface VillageShared {
+  screen: string | null
+  screenListeners: Set<() => void>
+  voice: Set<() => void>
+  send: Set<() => void>
+  voiceStop: Set<() => boolean>
+  voiceRequest: { agentId: string; at: number } | null
+  viewer: { images: VillageViewerImage[]; index: number } | null
+  viewerListeners: Set<() => void>
+}
+const shared: VillageShared = (() => {
+  const holder = globalThis as unknown as { __oasisVillageShared?: Partial<VillageShared> }
+  const record = (holder.__oasisVillageShared ??= {})
+  record.screen ??= null
+  record.screenListeners ??= new Set()
+  record.voice ??= new Set()
+  record.send ??= new Set()
+  record.voiceStop ??= new Set()
+  record.voiceRequest ??= null
+  record.viewer ??= null
+  record.viewerListeners ??= new Set()
+  return record as VillageShared
+})()
+
 // ─── screen mode (F): the camera fills the view with the focused agent's desk window ─────
 
-let screenAgentId: string | null = null
-/** F next to an agent opened its screen straight from the world: one Esc goes all the way back out. */
-let screenFromWorld = false
-const screenListeners = new Set<() => void>()
+const screenListeners = shared.screenListeners
 
 export function getVillageScreen(): string | null {
-  return screenAgentId
+  return shared.screen
 }
 
 export function setVillageScreen(agentId: string | null): void {
-  if (agentId === screenAgentId) return
-  screenAgentId = agentId
-  if (!agentId) screenFromWorld = false
+  if (agentId === shared.screen) return
+  shared.screen = agentId
   screenListeners.forEach(listener => listener())
 }
 
@@ -309,25 +333,59 @@ export function subscribeVillageScreen(listener: () => void): () => void {
   return () => { screenListeners.delete(listener) }
 }
 
-/** F while an agent is focused: zoom into its screen, or back out to the side panel. */
-export function toggleVillageScreen(): boolean {
+/** Which view is open: nothing, an agent's side panel (E), or its full screen (F). */
+export function currentVillageView(): VillageView {
   const focused = useOasisStore.getState().agentEngine.focusedAgentId
-  if (!focused) return false
-  setVillageScreen(screenAgentId === focused ? null : focused)
-  screenFromWorld = false // zoomed in from the side panel: Esc goes back to the panel
+  if (!focused) return VILLAGE_VIEW_NONE
+  return { kind: shared.screen === focused ? 'screen' : 'panel', agentId: focused }
+}
+
+/** The agent E and F open from nothing open: the selected one (a click on it), else the nearest. */
+export function villageViewTarget(): string | null {
+  const engine = useOasisStore.getState().agentEngine
+  const selected = getSelectedVillageAgent()
+  if (selected && engine.agents[selected]) return selected
+  return engine.nearbyAgentId
+}
+
+/** Go to `next` (nextVillageView decided it). False when nothing changed. */
+export function applyVillageView(next: VillageView): boolean {
+  const focused = useOasisStore.getState().agentEngine.focusedAgentId
+  if (next.kind === 'none') {
+    if (!focused && !shared.screen) return false
+    leaveVillageFocus()
+    return true
+  }
+  if (focused !== next.agentId) {
+    requestVillageVoiceOnOpen(null) // E and F are the quiet ways in (T opens with the mic)
+    if (!focusVillageAgent(next.agentId)) return true // placing or painting: it said why
+  }
+  setVillageScreen(next.kind === 'screen' ? next.agentId : null)
   return true
+}
+
+/** E, F or Esc, from a key or a button (the panel's "F screen", the full screen's "E panel" and close). */
+export function pressVillageView(key: VillageViewKey): boolean {
+  return applyVillageView(nextVillageView(currentVillageView(), key, villageViewTarget()))
+}
+
+/** F in the side panel, E on the full screen: the other view of the same agent. */
+export function toggleVillageScreen(): boolean {
+  const view = currentVillageView()
+  if (view.kind === 'none') return false
+  return pressVillageView(view.kind === 'panel' ? 'F' : 'E')
 }
 
 // ─── voice (T / Ctrl+Space) and send (Enter on the screen): the mounted composer listens ─
 
-const voiceListeners = new Set<() => void>()
+const voiceListeners = shared.voice
 
 export function subscribeVillageVoiceToggle(listener: () => void): () => void {
   voiceListeners.add(listener)
   return () => { voiceListeners.delete(listener) }
 }
 
-const sendListeners = new Set<() => void>()
+const sendListeners = shared.send
 
 export function subscribeVillageSend(listener: () => void): () => void {
   sendListeners.add(listener)
@@ -349,7 +407,7 @@ export function toggleVillageVoice(): boolean {
 }
 
 /** The mounted box answers true when it stopped a running dictation. */
-const voiceStopListeners = new Set<() => boolean>()
+const voiceStopListeners = shared.voiceStop
 
 export function subscribeVillageVoiceStop(listener: () => boolean): () => void {
   voiceStopListeners.add(listener)
@@ -365,22 +423,22 @@ export function stopVillageVoice(): boolean {
 
 // T next to an agent: the talk window opens, and its box starts the mic as soon as it is mounted.
 const VOICE_REQUEST_TTL_MS = 4000
-let voiceRequest: { agentId: string; at: number } | null = null
 
 export function requestVillageVoiceOnOpen(agentId: string | null): void {
-  voiceRequest = agentId ? { agentId, at: Date.now() } : null
+  shared.voiceRequest = agentId ? { agentId, at: Date.now() } : null
 }
 
 /** T opened this agent with the microphone on (asked a moment ago, not yet taken by its box). */
 export function isVillageVoiceRequested(agentId: string): boolean {
-  return Boolean(voiceRequest && voiceRequest.agentId === agentId && Date.now() - voiceRequest.at < VOICE_REQUEST_TTL_MS)
+  const request = shared.voiceRequest
+  return Boolean(request && request.agentId === agentId && Date.now() - request.at < VOICE_REQUEST_TTL_MS)
 }
 
 /** For the box that just mounted: should it start the mic? Answers true once. */
 export function takeVillageVoiceRequest(agentId: string): boolean {
-  const request = voiceRequest
+  const request = shared.voiceRequest
   if (!request || request.agentId !== agentId) return false
-  voiceRequest = null
+  shared.voiceRequest = null
   return Date.now() - request.at < VOICE_REQUEST_TTL_MS
 }
 
@@ -401,11 +459,10 @@ export interface VillageViewerImage {
   kind?: 'image' | 'video'
 }
 
-let viewer: { images: VillageViewerImage[]; index: number } | null = null
-const viewerListeners = new Set<() => void>()
+const viewerListeners = shared.viewerListeners
 
 export function getVillageImageViewer(): { images: VillageViewerImage[]; index: number } | null {
-  return viewer
+  return shared.viewer
 }
 
 export function subscribeVillageImageViewer(listener: () => void): () => void {
@@ -415,21 +472,22 @@ export function subscribeVillageImageViewer(listener: () => void): () => void {
 
 export function openVillageImages(images: VillageViewerImage[], index = 0): void {
   if (!images.length) return
-  viewer = { images, index: Math.max(0, Math.min(images.length - 1, index)) }
+  shared.viewer = { images, index: Math.max(0, Math.min(images.length - 1, index)) }
   viewerListeners.forEach(listener => listener())
 }
 
 export function closeVillageImages(): void {
-  if (!viewer) return
-  viewer = null
+  if (!shared.viewer) return
+  shared.viewer = null
   viewerListeners.forEach(listener => listener())
 }
 
 /** ← / → : the previous or next picture, wrapping around. */
 export function stepVillageImages(delta: number): void {
+  const viewer = shared.viewer
   if (!viewer || viewer.images.length < 2) return
   const n = viewer.images.length
-  viewer = { ...viewer, index: (viewer.index + delta + n) % n }
+  shared.viewer = { ...viewer, index: (viewer.index + delta + n) % n }
   viewerListeners.forEach(listener => listener())
 }
 
@@ -467,15 +525,17 @@ if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
     inPlaza: () => places.inPlaza,
     sound: () => getVillageSoundDebug(),
     /** The agent whose screen fills the view (F), or null. */
-    screen: () => screenAgentId,
+    screen: () => shared.screen,
     toggleScreen: () => toggleVillageScreen(),
+    /** E, F or Esc as the keys do it (the view table). */
+    view: (key?: VillageViewKey) => (key ? pressVillageView(key) : currentVillageView()),
     /** Show one subagent's work alone in its parent's panel (key: its key in `subagents`); null agentId: the whole thread. */
     focusSubagent: (agentId: string | null, key?: string) => {
       useOasisStore.getState().agentEngineDispatch({ type: 'subagent/focus', agentId, key: key ?? null })
       if (agentId) focusVillageAgent(agentId)
     },
     /** The open picture viewer: index and count, or null. */
-    viewer: () => (viewer ? { index: viewer.index, count: viewer.images.length } : null),
+    viewer: () => (shared.viewer ? { index: shared.viewer.index, count: shared.viewer.images.length } : null),
   }
 }
 
@@ -649,7 +709,7 @@ function worldNameNow(): string | null {
 
 export function handleVillageKeyDown(event: KeyboardEvent): boolean {
   // The image viewer has the keyboard (Esc, arrows) while it is open.
-  if (viewer) return false
+  if (shared.viewer) return false
   const village = useOasisStore.getState().agentEngine
   const input = useInputManager.getState()
   // Same gate as the world's own N key, plus the village session view itself (ui-focused while its panel is open).
@@ -666,6 +726,7 @@ export function handleVillageKeyDown(event: KeyboardEvent): boolean {
       return true
     }
   }
+  const target = villageViewTarget()
   const action = villageKeyAction({
     code: event.code,
     ctrl: event.ctrlKey,
@@ -676,46 +737,30 @@ export function handleVillageKeyDown(event: KeyboardEvent): boolean {
     typing: isTypingTarget(event.target),
     focusedAgentId: village.focusedAgentId,
     nearbyAgentId: village.nearbyAgentId,
+    targetAgentId: target,
     worldKeysFree: input.can().enterFocuses || input.inputState === 'agent-focus' || inSessionView,
     inPlaza: places.inPlaza,
     agentCount: village.order.length,
   })
   // E next to a helper (a subagent mini) opens its work in the parent's panel; it wins over the parent.
   const mini = places.nearbyMini
-  if (mini && event.code === 'KeyE' && (action === 'open' || (action === null && !event.ctrlKey && !event.metaKey && !event.altKey
+  if (mini && event.code === 'KeyE' && !village.focusedAgentId && (action === 'view' || (action === null && !event.ctrlKey && !event.metaKey && !event.altKey
     && !event.repeat && !isTypingTarget(event.target) && (input.can().enterFocuses || input.inputState === 'agent-focus' || inSessionView)))) {
     focusVillageSubagent(mini.agentId, mini.key)
     return true
   }
   switch (action) {
     case 'toggle-voice': return toggleVillageVoice()
-    case 'toggle-screen': return toggleVillageScreen()
+    // E, F, Esc: VILLAGE_VIEW_TABLE decides (village-keys.ts). Esc never stops the mic: voice typing goes on with
+    // the owner (the widget at the bottom left shows it, with Send and Stop).
+    case 'view': {
+      const key = villageViewKey(event.code)
+      return key ? applyVillageView(nextVillageView(currentVillageView(), key, target)) : false
+    }
     // The box doesn't hold the keyboard until you click it: Enter sends what you dictated.
     case 'send': return triggerVillageSend()
-    case 'escape':
-      // Esc closes, it never stops the mic: voice typing goes on with the owner (the widget at the bottom left
-      // shows it, with Send and Stop). T, the mic button or the widget stop it.
-      if (!screenAgentId) return false // the input manager's Esc leaves the agent
-      // Opened with F straight from the world: this Esc leaves the agent too (the input manager's, below).
-      if (screenFromWorld) {
-        setVillageScreen(null)
-        return false
-      }
-      setVillageScreen(null)
-      return true
     case 'talk':
       if (village.nearbyAgentId) talkToVillageAgent(village.nearbyAgentId)
-      return true
-    case 'open':
-      requestVillageVoiceOnOpen(null) // E is the quiet way in
-      if (village.nearbyAgentId) focusVillageAgent(village.nearbyAgentId)
-      return true
-    case 'screen': // F next to an agent: open it straight on its full screen
-      requestVillageVoiceOnOpen(null)
-      if (village.nearbyAgentId && focusVillageAgent(village.nearbyAgentId)) {
-        setVillageScreen(village.nearbyAgentId)
-        screenFromWorld = true
-      }
       return true
     case 'picker':
       openVillagePicker(true)

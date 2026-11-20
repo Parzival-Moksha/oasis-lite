@@ -4,13 +4,13 @@
 // Plain DOM, bottom left, always there in the village. It re-renders when the shown second changes
 // (work-vow-client ticks once a second), never per frame. A click opens the detail.
 
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react'
 import { useMindcraftLook } from './mindcraft-look'
 import { formatClock, WORK_VALOR, type WorkDayView, type WorkSnapshot, timeToGo } from '../../lib/village/work-vow'
 import { GAME_HUD_TEXT } from '../forge/GameKeycap'
 import { useOasisStore } from '../../store/oasisStore'
 import { getMissionState, subscribeMissions } from './village-mission-store'
-import { MindcraftWindow, openMindcraft } from './MindcraftView'
+import { MindcraftWindow, clearBand, openMindcraft, overlayObstacles } from './MindcraftView'
 import { getWorkVowState, setWorkFocus, setWorkMission, startWorkVow, subscribeWorkVow } from './work-vow-client'
 
 
@@ -114,10 +114,26 @@ function Detail({ snapshot, liveSeconds, onClose }: { snapshot: WorkSnapshot; li
     if (status === 'missed') return ` −${day?.penaltyXp ?? 0} · missed`
     return ' · open'
   }
+  // Beside the game rail, never under it (the owner, 2026-11-19 and 20): measured from the page.
+  const [left, setLeft] = useState(12)
+  useLayoutEffect(() => {
+    const measure = () => {
+      const band = clearBand(window.innerWidth, overlayObstacles(9300, '[data-ui-panel="village-work-vow"]'))
+      setLeft(band.left > 0 ? Math.round(band.left + 12) : 12)
+    }
+    measure()
+    const late = window.setTimeout(measure, 300)
+    window.addEventListener('resize', measure)
+    return () => {
+      window.clearTimeout(late)
+      window.removeEventListener('resize', measure)
+    }
+  }, [])
   return (
     <div
       data-ui-panel="village-work-vow"
-      className="mc-scope mc-popup oasis-frame fixed bottom-[92px] left-3 z-[9300] max-h-[calc(100vh-110px)] w-[350px] overflow-y-auto p-3 text-white shadow-[0_24px_70px_rgba(0,0,0,0.55)] backdrop-blur-xl max-[700px]:bottom-auto max-[700px]:top-[120px]"
+      style={{ left }}
+      className="mc-scope mc-popup oasis-frame fixed bottom-[92px] z-[9300] max-h-[calc(100vh-110px)] w-[350px] overflow-y-auto p-3 text-white shadow-[0_24px_70px_rgba(0,0,0,0.55)] backdrop-blur-xl max-[700px]:bottom-auto max-[700px]:top-[120px]"
     >
       <div className="mb-2 flex items-start justify-between">
         <div>
@@ -128,8 +144,14 @@ function Detail({ snapshot, liveSeconds, onClose }: { snapshot: WorkSnapshot; li
       </div>
       <div className={row}><span className="text-white/60">Today</span><span className="font-bold">{formatClock(liveSeconds)} · {snapshot.today.xp} XP</span></div>
       <button type="button" onClick={() => { onClose(); openMindcraft() }} className="mc-btn mt-2" data-tone="go">
-        Open Mindcraft: every day, mine and the agents&rsquo;
+        Mindcraft
       </button>
+      {snapshot.agentHours && (
+        <div className="mt-2 rounded-md border border-violet-300/20 bg-violet-400/5 px-2 py-1.5 text-[11.5px] leading-snug text-white/80">
+          <div><b className="text-violet-200">Agents today {formatClock(snapshot.agentHours.today)}</b> · yesterday {formatClock(snapshot.agentHours.yesterday)}{snapshot.agentHours.best ? ` · best ${formatClock(snapshot.agentHours.best.seconds)} (${snapshot.agentHours.best.date.slice(5)})` : ''}</div>
+          <div className="text-white/55">{snapshot.agentHours.next ? `${snapshot.agentHours.mark ? `${snapshot.agentHours.mark} now; ` : ''}${snapshot.agentHours.next.label} at ${snapshot.agentHours.next.hours} h a day` : 'uploaded'} (24 h alive · 72 h superalive · 168 h uploaded). Time inside the agents&rsquo; turns, helpers included; not time waiting.</div>
+        </div>
+      )}
       <WhereTimeWent snapshot={snapshot} />
       {snapshot.active && (
         <button type="button" onClick={() => { void setWorkMission(null) }} className="mc-btn mt-2" data-tone="stop">
@@ -206,6 +228,8 @@ export function WorkVowHud() {
   const free = snapshot.settings?.freeValor ?? WORK_VALOR.free
   const [what, rate]: [string, number] = snapshot.active
     ? [snapshot.active.title, WORK_VALOR.mission]
+    : state.inMindcraft
+      ? ['in Mindcraft', WORK_VALOR.mindcraft]
     : openMission
       ? [openMission.title, WORK_VALOR.mission]
       : agentFocus
@@ -246,6 +270,16 @@ export function WorkVowHud() {
             <span className="whitespace-nowrap text-[11px] font-bold" style={{ color: done ? GREEN : '#fde68a' }} title={`The goal is ${formatClock(snapshot.targetSeconds)} a day`}>
               {timeToGo(liveSeconds, snapshot.targetSeconds)}
             </span>
+            {/* The agents' own working hours today, next to his (the owner, 2026-11-20). */}
+            {snapshot.agentHours && (
+              <span
+                className="whitespace-nowrap text-[11px] font-bold"
+                style={{ color: snapshot.agentHours.mark ? '#c084fc' : 'rgba(216,180,254,0.85)' }}
+                title={`Agent hours: time inside the agents' turns, helpers included, not time waiting. Yesterday ${formatClock(snapshot.agentHours.yesterday)}. 24 h: alive · 72 h: superalive · 168 h: uploaded.`}
+              >
+                · agents {formatClock(snapshot.agentHours.today)}{snapshot.agentHours.mark ? ` · ${snapshot.agentHours.mark}` : ''}
+              </span>
+            )}
           </span>
           <span className="mc-status flex max-w-[min(420px,calc(100vw-120px))] items-start gap-1.5 text-[9.5px] leading-snug" style={{ ...GAME_HUD_TEXT, color: statusColor }} title={state.running ? `Every minute like this earns ${rate} XP. With nothing open it is ${free}; with an agent or a mission open it is 1.` : 'Nothing is being counted right now'}>
             {state.running && <span className="mt-[3px] h-1.5 w-1.5 shrink-0 animate-pulse rounded-full" style={{ background: statusColor, boxShadow: `0 0 6px ${statusColor}` }} />}

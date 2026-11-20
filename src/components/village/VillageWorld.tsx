@@ -70,11 +70,14 @@ import { AcademyLevelTag, AcademyVillageBody, useAcademyStone, useAcademyTrainee
 import { VillageVoice } from './VillageVoice'
 import { VillageTag, VillageTagDriver, deskScreenHeight, useVillageTagReach, villageTagReach } from './VillageTags'
 import { VillageLeaveEffect } from './VillageLeaveEffect'
+import { AgentPanelTabBar, ThreadFontScale, useAgentPanelTab } from './AgentPanelTabs'
+import { AgentControls } from './AgentSessionPanel'
 import { useVillageLeaving } from './village-leave'
 import { isStageWorldName, stationAtAnchor } from '../../lib/village/village-stage'
 import { getTagSettings } from '../../lib/village/tag-style'
 import { getVillageLooks, subscribeVillageLooks } from '../../lib/village/village-looks'
 import { getVillageHome, getVillageHomesVersion, subscribeVillageHomes, useVillageHomesSync } from './village-homes'
+import { isVillageAgentHere, useVillageWorldsVersion } from './village-worlds'
 import { readableAccent, tagMarker } from '../../lib/village/village-tags'
 import { getAgentAccent, getPanelLookVersion, subscribePanelLook } from '../../lib/village/panel-look'
 import { getVillageCombatVersion, getVillageVitals, subscribeVillageCombat } from '../../lib/village/village-combat'
@@ -100,9 +103,12 @@ import {
   villageLipSyncId,
 } from './village-companion'
 import { SettingsContext } from '../scene-lib/contexts'
+import { clipForPose, holdSeconds, type AgentPose } from '../../lib/village/agent-idles'
+import { CAST_CLIPS } from '../../lib/village/agent-cast'
+import { useCastPhase, useVillageCastWatcher } from './village-cast'
 import { DESK_SCREENS_DEFAULT, DESK_SCREEN_LIMIT, isDeskScreensMode, pickDeskScreens, type DeskDistance } from '../../lib/village/desk-screens'
+import { useKitStyle } from '@/components/ui-kit'
 
-const WORK_ANIMATION_ID = 'ual-talking'
 /** Helper labels show for the agents near the camera (the rule desk screens had before the setting). */
 const NEAR_AGENTS_MAX = 6
 /** Village overlays stay under the HUD and panels (drei's default z-range is ~16M). */
@@ -120,6 +126,24 @@ const PREFERRED_BODIES = [
   'EYEWizard', 'Juanita', 'LadyFawn', 'Mr', 'StitchWitch', 'Witch', 'VIPE_Hero__2723', 'VIPE_Hero__2784',
   'VIPE_Hero__2799', 'VIPE_Hero__2770', 'CoolAlien', 'CoolGuitar', 'EYE_Diviner', 'King_Mutatio',
 ].map(name => `/avatars/gallery/${name}.vrm`)
+
+/**
+ * What this agent's body plays while it stands (src/lib/village/agent-idles.ts): talking when it talks to the owner,
+ * a waiting idle when it needs him, a working one while it works, taking turns through its own order every 18 to
+ * 36 s. Settings > Agents "Idle variety" off: one clip per state.
+ */
+function useAgentPoseClip(agentId: string, pose: AgentPose): string | null {
+  const { settings } = useContext(SettingsContext)
+  const variety = settings.agentIdleVariety !== false
+  const [round, setRound] = useState(0)
+  const cycles = variety && (pose === 'waiting' || pose === 'working')
+  useEffect(() => {
+    if (!cycles) return
+    const timer = window.setInterval(() => setRound(r => r + 1), holdSeconds(agentId) * 1000)
+    return () => window.clearInterval(timer)
+  }, [agentId, cycles])
+  return clipForPose(agentId, pose, round, variety)
+}
 
 function useBodyPool(): string[] {
   return useMemo(() => {
@@ -281,6 +305,11 @@ function DeskWindow({ agentId, nearby, mode }: { agentId: string; nearby: boolea
   const agent = useOasisStore(s => s.agentEngine.agents[agentId])
   // The full screen (F) follows the chat look: transparency + blur for all, this agent's colour (PanelLook.tsx).
   const look = usePanelLook(agent?.sessionId || agentId)
+  // The page shown on the full screen (thread or settings): a hook, so above the early return.
+  const panelTab = useAgentPanelTab()
+  // The one menu style (ui-kit): Glass keeps this agent's own look; a textured style dresses the screen like every menu.
+  const menuStyle = useKitStyle()
+  const textured = menuStyle !== 'glass'
   if (!agent) return null
   const color = agent.readOnly ? VILLAGE_OBSERVED_COLOR : statusColor(effectiveStatus(agent))
   const size = DESK_WINDOW_PX[mode]
@@ -289,8 +318,11 @@ function DeskWindow({ agentId, nearby, mode }: { agentId: string; nearby: boolea
     <div
       data-ui-panel="village-desk-window"
       data-desk-mode={mode}
-      className="relative flex flex-col overflow-hidden rounded-2xl text-white"
-      style={{
+      data-kit-style={textured ? menuStyle : undefined}
+      className={textured ? 'kit-panel relative flex flex-col overflow-hidden text-white' : 'relative flex flex-col overflow-hidden rounded-2xl text-white'}
+      // willChange: its own compositing layer. Inside drei's CSS-3D transform the wheel does not scroll the thread
+      // without one (Glass gets one from its backdrop blur); measured by Companion, 2026-11-20.
+      style={textured ? { width: size.width, height: size.height, padding: screen ? 18 : 14, willChange: 'transform' } : {
         width: size.width,
         height: size.height,
         padding: screen ? 18 : 14,
@@ -317,11 +349,22 @@ function DeskWindow({ agentId, nearby, mode }: { agentId: string; nearby: boolea
       {/* the status color as a thin light along the top edge */}
       <div className="pointer-events-none absolute inset-x-0 top-0 h-[3px]" style={{ background: `linear-gradient(90deg, transparent, ${color}, transparent)` }} />
       <div className="flex min-h-0 flex-1 flex-col gap-2">
-        <AgentSessionView
-          agentId={agentId}
-          variant={screen ? 'screen' : '3d'}
-          header={<SessionWindowHeader agent={agent} nearby={nearby} screen={screen} />}
-        />
+        {/* On the full screen, the same two pages as the side panel (AgentPanelTabs.tsx). */}
+        {screen && panelTab === 'settings' ? (
+          <>
+            <SessionWindowHeader agent={agent} nearby={nearby} screen={screen} />
+            <AgentPanelTabBar />
+            <AgentControls agent={agent} />
+          </>
+        ) : (
+          <ThreadFontScale>
+            <AgentSessionView
+              agentId={agentId}
+              variant={screen ? 'screen' : '3d'}
+              header={screen ? <><SessionWindowHeader agent={agent} nearby={nearby} screen={screen} /><AgentPanelTabBar /></> : <SessionWindowHeader agent={agent} nearby={nearby} screen={screen} />}
+            />
+          </ThreadFontScale>
+        )}
       </div>
       {screen && (agent.owned || agent.bridged
         ? <VillageComposer key={agentId} agentId={agentId} large />
@@ -677,12 +720,21 @@ function VillageStation({ agentId, placement, avatarUrl, windowVisible, helperLa
   // until it is sent back to its desk. When it needs the owner it still comes, and goes back to that spot after.
   const sentSeq = useSyncExternalStore(subscribeAgentSelection, () => getSentGoalSeq(agentId), () => 0)
   const sent = sentSeq !== 0 && !staged && !visiting && !stone && !isCouncilOn()
-  const follower = useVillageFollower(agentId, placement, isVillageFollowOn(followKey, name) && !stone, visiting, staged ? Boolean(combatPose) : focused || Boolean(combatPose), ownerBusy, staged || sent)
+  // Casting a world change (village-cast.ts): it stays where it stands until the spell is done.
+  const castPhase = useCastPhase(agentId)
+  const follower = useVillageFollower(agentId, placement, isVillageFollowOn(followKey, name) && !stone, visiting, staged ? Boolean(combatPose) : focused || Boolean(combatPose) || castPhase !== null, ownerBusy, staged || sent)
   // Its voice (village-companion.ts): the clip plays from its head, and it gestures while it talks.
   const speaking = useSyncExternalStore(subscribeVillageSpeech, () => {
     const speech = getVillageSpeech()
     return speech?.agentId === agentId && speech.phase === 'speaking'
   }, () => false)
+  // In the F view it stands still and looks at you while it talks (the gesturing clip turns the head away from the camera).
+  const pose: AgentPose = focused && onScreen ? 'resting'
+    : speaking ? 'talking'
+    : needsSince !== null ? 'waiting'
+    : status === 'working' ? 'working'
+    : 'resting'
+  const poseClip = useAgentPoseClip(agentId, pose)
   const head = useRef<THREE.Group>(null)
   useEffect(() => {
     registerVillageHead(agentId, head.current)
@@ -749,9 +801,9 @@ function VillageStation({ agentId, placement, avatarUrl, windowVisible, helperLa
                 path={`${avatarUrl}#village`}
                 scale={1}
                 displayName={name}
-                // In the F view it stands still and looks at you while it talks (the gesturing clip turns the head away from the camera).
-                activityAnimationId={combatPose ? combatPose.animationId : (status === 'working' || speaking) && !(focused && onScreen) ? WORK_ANIMATION_ID : null}
-                activityOnce={Boolean(combatPose)}
+                activityAnimationId={combatPose ? combatPose.animationId : castPhase ? CAST_CLIPS[castPhase] : poseClip}
+                activityOnce={Boolean(combatPose) || (castPhase !== null && castPhase !== 'charge')}
+                activityFade={castPhase ? 0.12 : undefined}
                 moving={follower.walking && !combatPose}
                 lipSyncId={villageLipSyncId(agentId)}
               />
@@ -1000,6 +1052,8 @@ function VillageCameraRig() {
 // ─── the layer ──────────────────────────────────────────────────────────────
 
 export function VillageWorld() {
+  // Agents cast their world changes: watches their tool calls (village-cast.ts).
+  useVillageCastWatcher()
   // Re-render the layout only when the roster's identity changes, not on every event.
   const rosterKey = useOasisStore(s => s.agentEngine.order
     .map(id => {
@@ -1073,17 +1127,26 @@ export function VillageWorld() {
     return map
   }, [stage, castKey, seatsKey, terrainHeights, origin])
   // The ring as seated, with the homed ones moved to their homes (the mission wall stays with the ring).
+  // Agents in another world (village-worlds.ts): not here at all, so nothing looks for them in this world.
+  const worldsVersion = useVillageWorldsVersion()
+  const awayKey = useMemo(
+    () => (stage ? '' : roster.filter(agent => !isVillageAgentHere(agent.id)).map(agent => agent.id).join(',')),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [stage, roster, worldsVersion],
+  )
   const homed = useMemo(() => {
     const ids = new Set<string>()
     const map = new Map(placements)
+    for (const id of awayKey ? awayKey.split(',') : []) map.delete(id)
     for (const entry of homesKey ? homesKey.split('\u0002') : []) {
       const [id, x, z, yaw] = entry.split('\u0001')
+      if (!map.has(id)) continue
       const ground = sampleTerrainHeightAt(terrainHeights, Number(x), Number(z))
       map.set(id, stationAtAnchor([Number(x), ground, Number(z)], Number(yaw)))
       ids.add(id)
     }
     return { ids, placements: map }
-  }, [placements, homesKey, terrainHeights])
+  }, [placements, homesKey, terrainHeights, awayKey])
 
   // The desks, and out of the registry again when they change or the village goes. One effect for both: a
   // separate cleanup-only effect used to run after this one on a hot reload (React re-runs every effect then)
