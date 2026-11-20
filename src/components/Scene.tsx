@@ -42,6 +42,7 @@ import { ForgeRealm } from './realms/ForgeRealm'
 import PanoramaCapture from './forge/PanoramaCapture'
 import { ViewportScreenshotBridge } from './forge/ViewportScreenshotBridge'
 import { WizardConsole, type WizardMode } from './forge/WizardConsole'
+import { WizardDockViewOffset } from './forge/WizardDockViewOffset'
 // AssetExplorerWindow deleted — functionality lives in WizardConsole
 import { ObjectInspector } from './forge/ObjectInspector'
 import { ObjectHtmlOverlay } from './forge/ObjectHtmlOverlay'
@@ -87,6 +88,7 @@ import { VillageVoiceWidget } from './village/VillageVoiceWidget'
 import { VillageScreenBackdrop } from './village/VillageScreenBackdrop'
 import { ConnectionWarning } from './forge/ConnectionWarning'
 import { getVillageScreen, openVillagePicker, subscribeVillageScreen } from './village/village-actions'
+import { openSummonMenu } from './village/summon-request'
 import { installTestHarness } from '@/lib/test-harness'
 import { HOSTED_USER_LOCKED_SPELL_IDS, isHostedUserLockedSpell, type SpellId } from '@/lib/spellbook'
 import { useWorldEvents } from '@/hooks/useWorldEvents'
@@ -111,11 +113,19 @@ import { GAME_HUD_TEXT, GameKeycap } from './forge/GameKeycap'
 import { VoiceTypeMic } from './forge/VoiceTypeMic'
 import { PerfHeartbeat } from './forge/PerfHeartbeat'
 import { SunShadows } from './forge/SunShadows'
+import { RenderHygiene } from './forge/RenderHygiene'
+import { FlopSaverDriver } from './forge/FlopSaverDriver'
+import { useFlopCaps } from '@/lib/use-flop-caps'
 import { GameMenu, OPEN_CONFIG_EVENT, OPEN_HELP_EVENT } from './game-menu/GameMenu'
+import { CharacterMenu } from './village/CharacterMenu'
 import { GameMenuRailButton } from './game-menu/GameMenuRailButton'
 import { GameMenuCameraDrift } from './game-menu/GameMenuCameraDrift'
 import { AgentSelectionLayer } from './village/AgentSelectionLayer'
 import { GameTooltip } from './forge/GameTooltip'
+import { AnimationBrowser } from './forge/AnimationBrowser'
+import { SkyTransition } from './forge/SkyTransition'
+import { KitButton, KitConfirmHost } from './ui-kit'
+import { settingsLookStyle, useSettingsLook } from '@/lib/settings-look'
 import { useRailMenuExclusion } from '@/hooks/useRailMenuExclusion'
 import { MobileOasisControls, useIsMobileOasis } from './forge/MobileOasisControls'
 import { CombatBoltLayer } from './forge/CombatBoltLayer'
@@ -598,6 +608,7 @@ function DesktopKeyHints({ village = false, fpsFontSize = null }: { village?: bo
   const villageNearby = useOasisStore(s => Boolean(s.agentEngine.nearbyAgentId))
   const villageAgents = useOasisStore(s => s.agentEngine.order.length > 0)
   const hasSlides = useOasisStore(s => s.placedCatalogAssets.some(asset => Boolean(asset.imageUrl || asset.videoUrl)))
+  const flopLevel = useFlopCaps().level
   if (mobileOasis) return null
   if (agentScreenOpen && fpsFontSize === null) return null
   const keys = !agentScreenOpen
@@ -631,6 +642,11 @@ function DesktopKeyHints({ village = false, fpsFontSize = null }: { village?: bo
           </span>
         </>
       )}
+      {flopLevel > 0 && (
+        <span data-testid="oasis-flop-saver" className="col-span-2 text-right text-[9.5px] leading-[15px]" style={{ ...GAME_HUD_TEXT, color: '#fbbf24' }}>
+          Flop saver {flopLevel}/5
+        </span>
+      )}
       {keys && <>
       {selectedObjectId && (
         <span className="col-span-2 mb-0.5 text-right text-[8.5px]" style={{ ...GAME_HUD_TEXT, color: '#a5f3fc' }}>
@@ -654,7 +670,15 @@ function DesktopKeyHints({ village = false, fpsFontSize = null }: { village?: bo
 }
 
 function PostProcessing() {
-  const { settings } = useContext(SettingsContext)
+  const { settings: saved } = useContext(SettingsContext)
+  // Flop saver (src/lib/flop-saver.ts) holds post effects down while the frame rate is low.
+  const caps = useFlopCaps()
+  const settings = {
+    ...saved,
+    bloomEnabled: saved.bloomEnabled && caps.bloom,
+    vignetteEnabled: saved.vignetteEnabled && caps.vignette,
+    chromaticEnabled: saved.chromaticEnabled && caps.chromatic,
+  }
   const sprintActiveRef = useRef(false)
   const [sprintActive, setSprintActive] = useState(false)
   const chromaticRef = useRef<any>(null)
@@ -670,7 +694,7 @@ function PostProcessing() {
 
   useFrame(() => {
     const si = Math.max(0, sprintRef.current.intensity)
-    const isActive = !mobileOasis && si > 0.05
+    const isActive = !mobileOasis && si > 0.05 && caps.vignette
     if (isActive !== sprintActiveRef.current) {
       sprintActiveRef.current = isActive
       setSprintActive(isActive)
@@ -679,13 +703,13 @@ function PostProcessing() {
     // Imperatively update effect uniforms — no re-renders needed
     if (chromaticRef.current) {
       const base = settings.chromaticEnabled ? 0.003 : 0
-      const boost = mobileOasis ? 0 : si * 0.012
+      const boost = mobileOasis || !caps.chromatic ? 0 : si * 0.012
       const val = base + boost
       chromaticRef.current.offset = _offsetVec.current.set(val, val)
     }
     if (vignetteRef.current) {
       const baseDarkness = settings.vignetteEnabled ? 0.7 : 0
-      const boost = mobileOasis ? 0 : si * 0.4
+      const boost = mobileOasis || !caps.vignette ? 0 : si * 0.4
       const target = baseDarkness + boost
       const u = vignetteRef.current.uniforms?.get?.('darkness')
       if (u) u.value = target
@@ -1815,11 +1839,13 @@ export default function Scene() {
       // ─═̷─ Agents ─═̷─
       case 'summon-claude-code':
         // The village's summoning circle (a Claude Code agent with its own desk); outside the village, the CC window.
-        if (villageProfile) openVillagePicker(true)
+        if (villageProfile) openSummonMenu('claude')
         else placeQuickAgentWindow('anorak')
         return
       case 'summon-codex':
-        placeQuickAgentWindow('codex')
+        // In the village: the summon menu on Codex, which says what a Codex agent still needs.
+        if (villageProfile) openSummonMenu('codex')
+        else placeQuickAgentWindow('codex')
         return
       case 'summon-djinn':
         placeQuickAgentWindow('merlin')
@@ -1828,7 +1854,9 @@ export default function Scene() {
         placeQuickAgentWindow('openclaw')
         return
       case 'summon-hermes':
-        placeQuickAgentWindow('hermes')
+        // The village's summon menu on Hermes (the old "Connect Hermes" pairing window did nothing there).
+        if (villageProfile) openSummonMenu('hermes')
+        else placeQuickAgentWindow('hermes')
         return
       case 'browser':
         placeQuickAgentWindow('browser')
@@ -2058,9 +2086,13 @@ export default function Scene() {
         <color attach="background" args={['#07111a']} />
 
         {worldSkyBackground && <SkyBackground backgroundId={worldSkyBackground} />}
+        {/* One sky melts, rips or glitches into the next (Settings > World VFX > Sky change). */}
+        <SkyTransition />
 
         {/* ─═̷─═̷─🎮 CAMERA CONTROLLER — ONE owner, ONE useFrame, ZERO fights ─═̷─═̷─🎮 */}
         <CameraControllerComponent />
+        {/* The docked Wizard console: the view centre moves into what the panel leaves (forge/wizard-dock.ts). */}
+        <WizardDockViewOffset />
         <PointerLockRaycaster />
         <ScenePlayableSignal worldReady={playableWorldReady} worldId={playableWorldId} />
         {!villageProfile && <OnboardingSpawnPrimer controlMode={settings.controlMode} />}
@@ -2108,6 +2140,10 @@ export default function Scene() {
         {!hostedMode && <PerfHeartbeat readFps={readLatestFps} />}
         {/* Soft shadows from the world's sun (Config → Graphics → Shadows) */}
         <SunShadows />
+        {/* Scene-wide three.js cost fixes (see-through flat meshes drawn in one pass) */}
+        <RenderHygiene />
+        {/* Flop saver: effects off by tiers while the frame rate stays under 30 (Settings → Graphics) */}
+        <FlopSaverDriver />
         {/* The camera's slow drift behind the main menu (Esc). No frame callback while the menu is closed. */}
         <GameMenuCameraDrift />
         {/* The selected agent's effect and right-click-to-send. Nothing mounted while no agent is selected. */}
@@ -2129,7 +2165,8 @@ export default function Scene() {
         enabled={mobileOasis && (settings.controlMode === 'noclip' || settings.controlMode === 'third-person')}
         spellControlsEnabled={effectiveRp1Mode}
       />
-      {!villageProfile && <PlayerVitalsHud visible={effectiveRp1Mode && !isPortalZeroWorld} />}
+      {/* HP / mana / XP. In the village only while a combat spell is armed. */}
+      <PlayerVitalsHud visible={effectiveRp1Mode && !isPortalZeroWorld} combatOnly={villageProfile} />
       {!villageProfile && <PvPOverlay visible={effectiveRp1Mode && !isPortalZeroWorld} />}
       {!villageProfile && <WorldChatOverlay visible={Boolean(activeWorldId) && !activeWorldIsGoogleForm} />}
       {villageProfile && (
@@ -2190,8 +2227,9 @@ export default function Scene() {
         />
       )}
 
-      {/* Main game rail */}
-      <div className="fixed left-4 top-4 z-[190] flex flex-col gap-2 select-none max-[700px]:left-2 max-[700px]:top-2 max-[700px]:gap-1.5">
+      {/* Main game rail. Above the agent panels (9400 and up), so Settings, World and Profile open over them;
+          below the main menu (20000). */}
+      <div className="fixed left-4 top-4 z-[10400] flex flex-col gap-2 select-none max-[700px]:left-2 max-[700px]:top-2 max-[700px]:gap-1.5">
         {/* Always on screen: Menu, World, Spells, Agents. Profile, Settings and Help open from the main menu. */}
         <GameMenuRailButton />
         <ProfileButton hideRailButton />
@@ -2433,32 +2471,16 @@ export default function Scene() {
 
       <ObjectHtmlOverlay />
 
-      {/* EXIT RP1 — floating escape hatch when Ready Player 1 mode is active */}
+      {/* Play mode (RP1) is on: spells fire, editing is hidden. This goes back to build mode. */}
       {effectiveRp1Mode && !readOnlyForcesRp1 && (
-        <button
-          onClick={() => updateSetting('rp1Mode', false)}
-          style={{
-            position: 'fixed',
-            bottom: 88,
-            right: 24,
-            zIndex: 9999,
-            padding: '6px 16px',
-            borderRadius: 8,
-            background: 'rgba(0,0,0,0.7)',
-            border: '1px solid rgba(20,184,166,0.4)',
-            color: '#14b8a6',
-            fontSize: 12,
-            fontWeight: 600,
-            letterSpacing: '0.05em',
-            cursor: 'pointer',
-            backdropFilter: 'blur(8px)',
-            transition: 'all 0.2s',
-          }}
-          onMouseEnter={e => { e.currentTarget.style.background = 'rgba(20,184,166,0.2)'; e.currentTarget.style.borderColor = 'rgba(20,184,166,0.8)' }}
-          onMouseLeave={e => { e.currentTarget.style.background = 'rgba(0,0,0,0.7)'; e.currentTarget.style.borderColor = 'rgba(20,184,166,0.4)' }}
-        >
-          EXIT RP1
-        </button>
+        <div style={{ position: 'fixed', bottom: 88, right: 24, zIndex: 9999 }}>
+          <KitButton
+            onClick={() => updateSetting('rp1Mode', false)}
+            title="Play mode: spells fire, editing is hidden. Click to go back to build mode (select, move, create)."
+          >
+            Build mode
+          </KitButton>
+        </div>
       )}
 
       {/* ░▒▓ LOADING OVERLAY — removed. WorldLoadingBar (subscribe via
@@ -2479,8 +2501,14 @@ export default function Scene() {
 
       {/* Main menu: Esc when nothing else is open. Renders nothing while closed. */}
       <GameMenu />
+      {/* The player menu: Character, Skills, Keys (village/CharacterMenu.tsx). */}
+      <CharacterMenu />
       {/* Every `title` tooltip in the Oasis's own material instead of the browser's grey box. */}
       <GameTooltip />
+      {/* Every clip we may ship, played on your avatar (Settings > Experiments > Animations). */}
+      <AnimationBrowser />
+      {/* kitConfirm(): the Oasis's own yes/no dialog (src/components/ui-kit). */}
+      <KitConfirmHost />
 
       {/* OnboardingModal nuked — profile setup lives in ProfileButton */}
 
@@ -2605,6 +2633,7 @@ function ImageDropZone() {
 
 function SettingsMenu({ children, opacity }: { children: React.ReactNode; opacity: number }) {
   const [isOpen, setIsOpen] = useState(false)
+  const settingsLook = useSettingsLook()
   const menuRef = useRef<HTMLDivElement>(null)
   useUILayer('settings-menu', isOpen)
   const close = useCallback(() => setIsOpen(false), [])
@@ -2612,8 +2641,13 @@ function SettingsMenu({ children, opacity }: { children: React.ReactNode; opacit
   // The main menu's Config tile.
   useEffect(() => {
     const open = () => setIsOpen(true)
+    const close = () => setIsOpen(false)
     window.addEventListener(OPEN_CONFIG_EVENT, open)
-    return () => window.removeEventListener(OPEN_CONFIG_EVENT, open)
+    window.addEventListener('oasis:close-config', close)
+    return () => {
+      window.removeEventListener(OPEN_CONFIG_EVENT, open)
+      window.removeEventListener('oasis:close-config', close)
+    }
   }, [])
 
   useEffect(() => {
@@ -2637,8 +2671,9 @@ function SettingsMenu({ children, opacity }: { children: React.ReactNode; opacit
         <div
           data-ui-panel
           data-rail-menu="settings"
-          className="fixed bottom-4 left-[10.25rem] top-4 z-[260] flex w-[min(960px,calc(100vw-11.5rem))] overflow-hidden rounded-lg border border-white/10 bg-black/[0.92] font-mono text-white shadow-[0_0_54px_rgba(0,0,0,0.68),0_0_38px_rgba(167,139,250,0.18)] backdrop-blur-md max-[700px]:bottom-2 max-[700px]:left-2 max-[700px]:right-2 max-[700px]:top-[58px] max-[700px]:w-auto"
-          style={{ opacity }}
+          className="fixed bottom-4 left-[10.25rem] top-4 z-[260] flex w-[min(960px,calc(100vw-11.5rem))] overflow-hidden rounded-lg border border-white/10 font-mono text-white shadow-[0_0_54px_rgba(0,0,0,0.68),0_0_38px_rgba(167,139,250,0.18)] max-[700px]:bottom-2 max-[700px]:left-2 max-[700px]:right-2 max-[700px]:top-[58px] max-[700px]:w-auto"
+          // Blur, see-through and colour from the controls in its top right (settings-look.ts).
+          style={settingsLookStyle(settingsLook)}
           onMouseDown={event => event.stopPropagation()}
         >
           {children}

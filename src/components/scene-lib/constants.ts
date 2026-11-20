@@ -47,7 +47,7 @@ export const defaultSettings: OasisSettings = {
   mouseSensitivity: 1.0,
   moveSpeed: 10,
   fov: 75,
-  showGrid: true,
+  showGrid: false,
   rp1Mode: false,
   // BOLT LAB — defaults pick the "classic" / drafted-first variant per spell.
   fireboltDesign: 'A',

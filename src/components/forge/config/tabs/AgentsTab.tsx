@@ -11,9 +11,12 @@ import { SettingsContext } from '@/components/scene-lib/contexts'
 import { DESK_SCREEN_LIMIT, isDeskScreensMode, type DeskScreensMode } from '@/lib/village/desk-screens'
 import { isVillageSoundOn, setVillageSoundOn, subscribeVillageSound } from '@/components/village/village-sound'
 import { TAG_SIZE, TAG_STYLES, getTagSettings, getTagSettingsVersion, setTagSettings, subscribeTagSettings } from '@/lib/village/tag-style'
+import { KitTabs, KitToggle } from '@/components/ui-kit'
+import { LEAVE_EFFECTS, getVillageLooks, getVillageLooksVersion, setVillageLooks, subscribeVillageLooks } from '@/lib/village/village-looks'
 import { isVillageVoiceOn, setVillageVoiceOn, subscribeVillageVoice } from '@/components/village/village-companion'
 import { WakeUpSettings } from './WakeUpSettings'
 import { AccountsSettings } from './AccountsSettings'
+import { ServicesSettings } from './ServicesSettings'
 
 /** An on/off row: a switch, a title and a line on what it does now. */
 function SwitchRow({ on, onToggle, title, hint, data }: { on: boolean; onToggle: () => void; title: string; hint: string; data: string }) {
@@ -53,6 +56,8 @@ export function AgentsTab() {
   const voicesOn = useSyncExternalStore(subscribeVillageVoice, isVillageVoiceOn, () => true)
   useSyncExternalStore(subscribeTagSettings, getTagSettingsVersion, () => 0)
   const tagSettings = getTagSettings()
+  useSyncExternalStore(subscribeVillageLooks, getVillageLooksVersion, () => 0)
+  const looks = getVillageLooks()
 
   return (
     <div className="space-y-4">
@@ -92,6 +97,38 @@ export function AgentsTab() {
             />
           </label>
           <div className="text-[10px] text-gray-500">The name always turns to you; the marker (! or ?) stands upright and turns slowly. The colour is the agent's own, set in its settings menu.</div>
+        </div>
+        <SwitchRow
+          data="village-keys-bottom"
+          on={tagSettings.keysAtBottom}
+          onToggle={() => setTagSettings({ keysAtBottom: !tagSettings.keysAtBottom })}
+          title="T / E / F also at the bottom of the screen"
+          hint={tagSettings.keysAtBottom ? 'The banner shows too, under the keys over the agent you are near.' : 'Off: the keys show over the agent you are near, in the world.'}
+        />
+        <div>
+        </div>
+      </section>
+      <section>
+        <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1.5 font-mono">Agents in the village</div>
+        {/* The shared UI kit (components/ui-kit): its look follows Settings' style switch. */}
+        <div className="flex flex-col gap-2 py-1" data-village-looks>
+          <KitToggle
+            checked={looks.desks}
+            onChange={desks => setVillageLooks({ desks })}
+            label="Desks"
+            hint={looks.desks ? 'Each agent on the ring has its desk.' : 'No desks: the agents stand in the ring; their screens and markers stay.'}
+          />
+          <div>
+            <div className="mb-1 text-sm text-gray-300">When an agent leaves</div>
+            <KitTabs tabs={LEAVE_EFFECTS.map(choice => ({ id: choice.id, label: choice.label, title: choice.hint }))} active={looks.leave} onChange={leave => setVillageLooks({ leave })} />
+            <div className="kit-hint mt-1">{LEAVE_EFFECTS.find(choice => choice.id === looks.leave)?.hint} Dismiss an agent (its panel, or Delete) to see it.</div>
+          </div>
+          <KitToggle
+            checked={looks.leaveSound}
+            onChange={leaveSound => setVillageLooks({ leaveSound })}
+            label="Sound when an agent leaves"
+            hint={looks.leaveSound ? 'A rising whine for the spin, a click and hum for the CRT, a poof (made on the spot, no files).' : 'Silent.'}
+          />
         </div>
       </section>
       <section>
@@ -260,6 +297,8 @@ export function AgentsTab() {
       <WakeUpSettings />
       {/* The Claude accounts the agents run on, and the village's default (the engine keeps them). */}
       <AccountsSettings />
+      {/* The agent engine and the page server: their state and a Restart button each (scripts/oasis-supervisor.mjs). */}
+      <ServicesSettings />
     </div>
   )
 }

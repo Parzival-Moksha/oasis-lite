@@ -12,10 +12,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useInputManager } from '@/lib/input-manager'
 import { useOasisStore } from '@/store/oasisStore'
 import { openMindcraft } from '@/components/village/MindcraftView'
-import { openAcademyMap } from '@/components/village/academy-store'
-import { openKeychain } from '@/components/village/keychain-store'
-import { showNotice } from '@/components/forge/GlobalNotice'
-import { isVillageProfileClient } from '@/lib/oasis-profile'
+import { openCharacter } from '@/components/village/character-store'
 import { cellsPath, textCells, textWidth } from '@/components/forge/splash/intro-overlay'
 import { useGameMenu } from '@/lib/game-menu/menu-store'
 import { getSelectedVillageAgent, selectVillageAgent } from '@/lib/village/agent-selection'
@@ -314,8 +311,9 @@ function GameMenuScreen({ closing }: { closing: boolean }) {
       sway.current.y = stepSpring(sway.current.y, ty, 60, 14, dt)
       const sx = sway.current.x.x
       const sy = sway.current.y.x
-      if (stageRef.current) stageRef.current.style.transform = `translate3d(${(-sx * 10).toFixed(2)}px, ${(-sy * 7).toFixed(2)}px, 0)`
-      if (titleTiltRef.current) titleTiltRef.current.style.transform = `rotateX(${(-sy * 9 + 6).toFixed(2)}deg) rotateY(${(sx * 16).toFixed(2)}deg)`
+      const k = prefsRef.current.tiltAmount
+      if (stageRef.current) stageRef.current.style.transform = `translate3d(${(-sx * 10 * k).toFixed(2)}px, ${(-sy * 7 * k).toFixed(2)}px, 0)`
+      if (titleTiltRef.current) titleTiltRef.current.style.transform = `rotateX(${(-sy * 9 * Math.min(k, 3) + 6).toFixed(2)}deg) rotateY(${(sx * 16 * Math.min(k, 3)).toFixed(2)}deg)`
       if (Math.abs(sx - tx) > 0.002 || Math.abs(sy - ty) > 0.002 || Math.abs(sway.current.x.v) + Math.abs(sway.current.y.v) > 0.01) moving = true
       loop.current.raf = moving && !closingRef.current ? requestAnimationFrame(frame) : 0
     }
@@ -361,17 +359,8 @@ function GameMenuScreen({ closing }: { closing: boolean }) {
     // Continue from mouse-look gives the mouse back to the camera once the menu is gone.
     menu.closeMenu({ relock: id === 'continue' && menu.openedFromMouseLook })
     if (id === 'mindcraft') openMindcraft()
-    // The Academy's skill map (also K): it lives in the Agent Village.
-    if (id === 'skills') {
-      if (isVillageProfileClient()) openAcademyMap()
-      else showNotice('Skills live in the Agent Village: open the Oasis with ?profile=village.', 'info')
-    }
-    // The Academy's keychain: which keys the agents hold.
-    if (id === 'keychain') {
-      if (isVillageProfileClient()) openKeychain()
-      else showNotice('The keychain lives in the Agent Village: open the Oasis with ?profile=village.', 'info')
-    }
-    if (id === 'profile') window.dispatchEvent(new CustomEvent(OPEN_PROFILE_EVENT))
+    // The player menu: Character, Skills (K) and Keys (CharacterMenu.tsx).
+    if (id === 'character') openCharacter()
     if (id === 'config') window.dispatchEvent(new CustomEvent(OPEN_CONFIG_EVENT))
     if (id === 'help') window.dispatchEvent(new CustomEvent(OPEN_HELP_EVENT))
   }, [])
@@ -397,7 +386,7 @@ function GameMenuScreen({ closing }: { closing: boolean }) {
     onPointerMove: (event: React.PointerEvent<HTMLButtonElement>) => {
       if (!prefsRef.current.tilt) return
       const { px, py } = localPoint(event, event.currentTarget.parentElement ?? event.currentTarget)
-      Object.assign(inputs.current[index], followTilt(px, py))
+      Object.assign(inputs.current[index], followTilt(px, py, 9 * prefsRef.current.tiltAmount))
       kick()
     },
     onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => {

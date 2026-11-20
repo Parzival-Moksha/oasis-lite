@@ -36,6 +36,11 @@ import { deriveAvatarAnchoredWindowPlacement } from '../../lib/agent-avatar-util
 import { getLiveObjectTransform } from '../../lib/live-object-transforms'
 import { PORTAL_GATE_VARIANT_DEFS, type PortalGateVariant } from '../../lib/portal-gates'
 import { portalThumbPath } from '../../lib/portal-thumbnails'
+import { EnvironmentTab } from './wizard/EnvironmentTab'
+import { CatalogCategories } from './wizard/CatalogCategories'
+import { KitButton, KitPanel, KitTabs } from '@/components/ui-kit'
+import { WIZARD_DOCK_MARGIN, getWizardDockWidth, setWizardDockOpen, setWizardDockWidth, useWizardDockVersion, wizardDockGeometry } from '@/lib/forge/wizard-dock'
+import { requestCatalogThumbnails } from '../../hooks/useUnifiedThumbnailQueue'
 import {
   buildAudioPlacementPending,
   buildImagePlacementPending,
@@ -754,7 +759,10 @@ function MediaLightbox({ url, onClose }: { url: string; onClose: () => void }) {
 }
 
 function MediaTab({ cols, onRequestDelete }: { cols: number; onRequestDelete: (target: { url: string; name: string; placedCount: number }, onConfirm: () => Promise<void>) => void }) {
-  const [subTab, setSubTab] = useState<'generate' | 'image' | 'video' | 'audio'>('generate')
+  // Generation is the spell book's job (owner, 2026-11-19 at 16:49): Media is the gallery and the uploads.
+  // What the spells made sits under "Made by spells"; making more opens the spell book.
+  const [subTab, setSubTab] = useState<'generated' | 'image' | 'video' | 'audio'>('generated')
+  const generatedImages = useOasisStore(s => s.generatedImages)
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([])
   const [loading, setLoading] = useState(false)
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null)
@@ -834,11 +842,11 @@ function MediaTab({ cols, onRequestDelete }: { cols: number; onRequestDelete: (t
     return count
   }, [placedCatalogAssets, behaviors])
 
-  const filtered = mediaItems.filter(m => subTab === 'generate' ? false : m.type === subTab)
+  const filtered = mediaItems.filter(m => subTab === 'generated' ? false : m.type === subTab)
   const formatSize = (bytes: number) => bytes > 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${(bytes / 1024).toFixed(0)}KB`
 
   const subTabs = [
-    { key: 'generate' as const, label: 'Generate', icon: '\u{1F3A8}' },
+    { key: 'generated' as const, label: 'Made by spells', icon: '\u{2728}' },
     { key: 'image' as const, label: 'Images', icon: '\u{1F5BC}' },
     { key: 'video' as const, label: 'Videos', icon: '\u{1F3AC}' },
     { key: 'audio' as const, label: 'Audio', icon: '\u{1F3B5}' },
@@ -847,23 +855,16 @@ function MediaTab({ cols, onRequestDelete }: { cols: number; onRequestDelete: (t
   return (
     <div className="space-y-3">
       {/* Sub-tab pills */}
-      <div className="flex gap-1 flex-wrap">
-        {subTabs.map(t => (
-          <button
-            key={t.key}
-            onClick={() => setSubTab(t.key)}
-            className={`text-[10px] px-2 py-1 rounded transition-colors ${
-              subTab === t.key
-                ? 'bg-pink-500/20 text-pink-300 border border-pink-500/40'
-                : 'text-gray-400 border border-gray-700/30 hover:text-white hover:border-gray-500/50'
-            }`}
-          >
-            {t.icon} {t.label}
-          </button>
-        ))}
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <CatalogCategories
+            items={subTabs.map(t => ({ id: t.key, label: `${t.icon} ${t.label}`, count: t.key === 'generated' ? generatedImages.length : mediaItems.filter(m => m.type === t.key).length }))}
+            active={subTab}
+            onChange={id => setSubTab(id as typeof subTab)}
+          />
+        </div>
         {/* Upload button */}
-        <label className="text-[10px] px-2 py-1 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 hover:bg-sky-500/25 transition-colors cursor-pointer ml-auto">
-          + Upload
+        <KitButton className="shrink-0" onClick={() => fileInputRef.current?.click()} title="Upload pictures, videos or sounds from this computer">+ Upload</KitButton>
           <input
             ref={fileInputRef}
             type="file"
@@ -872,25 +873,45 @@ function MediaTab({ cols, onRequestDelete }: { cols: number; onRequestDelete: (t
             onChange={e => handleUpload(e.target.files)}
             className="hidden"
           />
-        </label>
       </div>
 
-      {/* Generate sub-tab = ImagineTab (passes cols + lightbox) */}
-      {subTab === 'generate' && (
-        <ImagineTab
-          cols={cols}
-          setLightboxUrl={setLightboxUrl}
-          onRequestDelete={(image, placedCount) => {
-            onRequestDelete(
-              { url: image.url, name: image.prompt.slice(0, 30) || 'generated image', placedCount },
-              async () => { removeGeneratedImage(image.id) }
-            )
-          }}
-        />
+      {/* Made by spells: the pictures the spell book generated. Making more is the spell book's job. */}
+      {subTab === 'generated' && (
+        <>
+          <KitButton variant="primary" className="w-full" onClick={() => window.dispatchEvent(new CustomEvent('oasis:open-spelltab', { detail: { spellId: 'text-to-pic' } }))} title="Opens the spell book's picture spell">
+            ✨ Make a picture with a spell
+          </KitButton>
+          {generatedImages.length === 0 ? (
+            <div className="py-6 text-center text-[11px] opacity-75">Nothing made yet. Pictures you make with spells appear here.</div>
+          ) : (
+            <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+              {[...generatedImages].reverse().map(img => {
+                const placedCount = placedCatalogAssets.filter(ca => ca.imageUrl === img.url).length
+                return (
+                  <AssetCard
+                    key={img.id}
+                    id={img.id}
+                    name={img.prompt}
+                    type="media-image"
+                    thumbnailUrl={img.url}
+                    mediaUrl={img.url}
+                    isInWorld={placedCount > 0}
+                    accentColor="#EC4899"
+                    subtitle={new Date(img.createdAt).toLocaleDateString()}
+                    onClick={() => enterPlacementMode(buildImagePlacementPending({ name: img.prompt.slice(0, 24), imageUrl: img.url }))}
+                    onDelete={() => onRequestDelete({ url: img.url, name: img.prompt.slice(0, 30) || 'generated image', placedCount }, async () => { removeGeneratedImage(img.id) })}
+                    onViewFullscreen={() => setLightboxUrl(img.url)}
+                    onPlaceWithFrame={() => enterPlacementMode(buildImagePlacementPending({ name: img.prompt.slice(0, 24), imageUrl: img.url, frameStyle: 'gilded' }))}
+                  />
+                )
+              })}
+            </div>
+          )}
+        </>
       )}
 
       {/* Media browser */}
-      {subTab !== 'generate' && (
+      {subTab !== 'generated' && (
         <>
           {loading && <div className="text-[10px] text-gray-500 text-center py-4">Loading...</div>}
 
@@ -996,7 +1017,7 @@ interface WizardConsoleProps {
 const WIZARD_TABS = [
   { key: 'conjure', label: 'Conjure', icon: '✨', color: 'orange', title: 'Text-to-3D conjuring' },
   { key: 'craft', label: 'Craft', icon: '⚒️', color: 'blue', title: 'LLM procedural geometry' },
-  { key: 'world', label: 'World', icon: '🌍', color: 'emerald', title: 'Sky, ground, terrain' },
+  { key: 'world', label: 'Environment', icon: '🌄', color: 'emerald', title: 'Lights, Background, Ground, Elevation' },
   { key: 'assets', label: 'Assets', icon: '📦', color: 'yellow', title: 'Pre-made 3D asset catalog' },
   { key: 'placed', label: 'Placed', icon: '📍', color: 'cyan', title: 'All objects placed in this world' },
   { key: 'agents', label: 'Agents', icon: '💻', color: 'purple', title: '3D agent windows in this world' },
@@ -1011,7 +1032,8 @@ const WIZARD_TABS = [
   title: string
 }>
 
-const WIZARD_TAB_ORDER: WizardMode[] = ['world', 'assets', 'media', 'music', 'video', 'agents', 'craft', 'conjure', 'placed']
+// Music and Video are generation: the spell book's job (owner, 2026-11-19 at 16:49), so they left the console.
+const WIZARD_TAB_ORDER: WizardMode[] = ['world', 'assets', 'media', 'agents', 'craft', 'conjure', 'placed']
 const WIZARD_TAB_LABEL_OVERRIDES: Partial<Record<WizardMode, string>> = {
   agents: '3D Agents',
   craft: 'Crafting',
@@ -1304,7 +1326,29 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
   const portalThumbVersion = usePortalThumbnailGenerator()
 
   // ░▒▓ Catalog thumbnail generator — manual trigger for 100+ GLB renders ▓▒░
+  // Docked on the right like the agent panel; the 3D view's centre moves into what is left (lib/forge/wizard-dock.ts).
+  useWizardDockVersion()
+  const [viewportWidth, setViewportWidth] = useState(() => (typeof window === 'undefined' ? 1600 : window.innerWidth))
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+  useEffect(() => {
+    setWizardDockOpen(isOpen)
+    return () => setWizardDockOpen(false)
+  }, [isOpen])
   const catalogThumbGen = useCatalogThumbnailGenerator()
+  void catalogThumbGen
+  // First sight of the catalog: any model with no picture on disk gets one rendered, the category in view first.
+  useEffect(() => {
+    if (!isOpen || mode !== 'assets' || assetSubTab !== 'catalog') return
+    requestCatalogThumbnails(ASSET_CATALOG.filter(a => assetCategory === 'all' || a.category === assetCategory).map(a => a.id))
+  }, [isOpen, mode, assetSubTab, assetCategory])
+  // Conjured, Crafted and Images left the catalog; an old link to them lands on the catalog.
+  useEffect(() => {
+    if (assetSubTab === 'conjured' || assetSubTab === 'crafted' || assetSubTab === 'images') setAssetSubTab('catalog')
+  }, [assetSubTab])
 
   // ░▒▓ Clear preview + exit paint mode when switching tabs ▓▒░
   useEffect(() => {
@@ -1703,6 +1747,19 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
 
   if (!isOpen) return null
 
+  const dock = wizardDockGeometry(viewportWidth, getWizardDockWidth())
+  const startDockResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const handle = event.currentTarget
+    handle.setPointerCapture(event.pointerId)
+    const move = (e: PointerEvent) => setWizardDockWidth(window.innerWidth - WIZARD_DOCK_MARGIN - e.clientX)
+    const up = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up) }
+    handle.addEventListener('pointermove', move)
+    handle.addEventListener('pointerup', up)
+    handle.addEventListener('pointercancel', up)
+  }
+
   const forgeColor = '#F97316' // orange-500
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1710,79 +1767,45 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
   // ═══════════════════════════════════════════════════════════════════════════
 
   return createPortal(
-    <div
+    <KitPanel
       data-menu-portal="wizard-console"
       data-ui-panel
-      className="fixed rounded-xl border overflow-hidden shadow-2xl flex flex-col"
+      icon={<span className="text-lg leading-none">🧙‍♂️</span>}
+      title={<>{hostedVariant ? 'World Console' : 'Wizard Console'}{activeCount > 0 && <span className="ml-2 animate-pulse text-[11px]" title="Spells at work">&#9679; {activeCount}</span>}</>}
+      onClose={onClose}
       style={{
+        // Inline: the kit sets .kit-panel { position: relative }, which would beat a class.
+        position: 'fixed',
         zIndex: useOasisStore.getState().getPanelZIndex('wizard', 9999),
-        left: position.x,
-        top: position.y,
-        width: size.width,
-        height: size.height,
-        backgroundColor: `rgba(0, 0, 0, ${opacity})`,
-        borderColor: activeCount > 0 ? `${forgeColor}66` : 'rgba(100, 100, 100, 0.3)',
-        boxShadow: activeCount > 0
-          ? `0 0 30px ${forgeColor}33, 0 0 60px ${forgeColor}11`
-          : '0 0 20px rgba(0, 0, 0, 0.5)',
+        top: WIZARD_DOCK_MARGIN,
+        bottom: WIZARD_DOCK_MARGIN,
+        right: WIZARD_DOCK_MARGIN,
+        width: dock.width,
+        // Placing: the console fades so the world behind it shows where the thing will land (owner, 10:22).
+        opacity: placementPending ? 0.4 : 1,
+        transition: 'opacity 180ms ease-out',
       }}
       onMouseDown={(e) => { e.stopPropagation(); useOasisStore.getState().bringPanelToFront('wizard') }}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* ─═̷─═̷─ HEADER — Draggable ─═̷─═̷─ */}
-      <div
-        className="px-3 py-2 border-b border-gray-700/50 flex items-center justify-between cursor-move select-none flex-shrink-0"
-        onMouseDown={handleDragStart}
-        style={{
-          background: activeCount > 0
-            ? `linear-gradient(135deg, ${forgeColor}22 0%, rgba(0,0,0,0) 100%)`
-            : 'rgba(30, 30, 30, 0.5)',
-        }}
-      >
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <span className="text-lg">🧙‍♂️</span>
-          {size.width >= 520 && <span className="text-sm tracking-widest" style={{ color: forgeColor, fontFamily: "'Palatino Linotype', 'Book Antiqua', Palatino, Georgia, serif", fontWeight: 700, fontVariant: 'small-caps', letterSpacing: '0.15em' }}>{hostedVariant ? 'World Console' : 'Wizard Console'}</span>}
-          {activeCount > 0 && (
-            <span className="text-yellow-400 text-xs animate-pulse">&#9679; {activeCount}</span>
-          )}
-        </div>
-
-        <div className="flex items-center gap-1 min-w-0 flex-1 ml-2 overflow-hidden">
-          {/* ░▒▓ Adaptive tab strip — icons always, labels when there's room ▓▒░ */}
-          <div ref={tabStripRef} className="flex items-center gap-1 overflow-x-auto min-w-0 flex-1 pb-0.5" style={{ scrollbarWidth: 'none' }}>
-            {visibleTabs.map(tab => (
-              <button
-                key={tab.key}
-                onClick={() => setMode(tab.key)}
-                className={`inline-flex min-w-fit flex-shrink-0 items-center justify-center text-xs px-1.5 py-0.5 rounded transition-colors whitespace-nowrap ${
-                  mode === tab.key
-                    ? `bg-${tab.color}-500/20 text-${tab.color}-400 border border-${tab.color}-500/50`
-                    : 'text-gray-300 border border-transparent hover:text-white'
-                }`}
-                title={tab.title}
-                style={mode === tab.key ? {
-                  backgroundColor: `rgba(${tab.color === 'orange' ? '249,115,22' : tab.color === 'blue' ? '59,130,246' : tab.color === 'emerald' ? '16,185,129' : tab.color === 'yellow' ? '234,179,8' : tab.color === 'cyan' ? '6,182,212' : tab.color === 'purple' ? '168,85,247' : tab.color === 'violet' ? '139,92,246' : tab.color === 'rose' ? '244,63,94' : '236,72,153'}, 0.2)`,
-                  color: `rgb(${tab.color === 'orange' ? '251,146,60' : tab.color === 'blue' ? '96,165,250' : tab.color === 'emerald' ? '52,211,153' : tab.color === 'yellow' ? '250,204,21' : tab.color === 'cyan' ? '34,211,238' : tab.color === 'purple' ? '192,132,252' : tab.color === 'violet' ? '196,181,253' : tab.color === 'rose' ? '253,164,175' : '244,114,182'})`,
-                  borderColor: `rgba(${tab.color === 'orange' ? '249,115,22' : tab.color === 'blue' ? '59,130,246' : tab.color === 'emerald' ? '16,185,129' : tab.color === 'yellow' ? '234,179,8' : tab.color === 'cyan' ? '6,182,212' : tab.color === 'purple' ? '168,85,247' : tab.color === 'violet' ? '139,92,246' : tab.color === 'rose' ? '244,63,94' : '236,72,153'}, 0.5)`,
-                } : undefined}
-              >
-                <span className="flex-shrink-0 text-sm leading-none">{tab.icon}</span>{showTabLabels && <span className="ml-1">{tab.label}</span>}
-              </button>
-            ))}
-          </div>
-          {/* ░▒▓ Fixed controls — NEVER shrink, always visible ▓▒░ */}
-          {/* The old gear/settings button moved to the global Config menu
-              (rail "CONFIG" → src/components/forge/config/ConfigMenu.tsx). */}
-          <div className="flex items-center gap-1 flex-shrink-0">
-            <button
-              onClick={onClose}
-              className="text-gray-500 hover:text-white transition-colors text-lg leading-none ml-1"
-            >
-              &#215;
-            </button>
-          </div>
-        </div>
+      {/* The left edge: drag sideways to make the console wider or narrower (remembered). */}
+      {dock.side === 'right' && (
+        <div
+          className="absolute -left-1.5 top-0 bottom-0 z-10 w-3 cursor-ew-resize"
+          onPointerDown={startDockResize}
+          onDoubleClick={() => setWizardDockWidth(null)}
+          title="Drag to resize (double-click: back to a third of the screen)"
+          data-wizard-dock-handle
+        />
+      )}
+      <div className="flex h-full min-h-0 flex-col">
+      <div className="mb-2 flex-shrink-0" data-wizard-tabs>
+        <KitTabs
+          tabs={visibleTabs.map(tab => ({ id: tab.key, label: <span className="whitespace-nowrap">{tab.icon}{dock.width >= 520 ? ` ${tab.label}` : ''}</span>, title: tab.title }))}
+          active={mode}
+          onChange={id => setMode(id)}
+        />
       </div>
 
       {/* ─═̷─═̷─ PLACEMENT MODE INDICATOR ─═̷─═̷─ */}
@@ -2061,403 +2084,11 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
       )}
 
       {/* ─══ॐ══─ GALLERY / WORLD / ASSETS / PLACED / SETTINGS ─══ॐ══─ */}
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
         {mode === 'world' ? (
           <div className="space-y-4">
 
-            {/* ░▒▓█ SKY BACKGROUND — The heavens above █▓▒░ */}
-            <div>
-              <button onClick={() => toggleSection('sky')} className="w-full flex items-center justify-between px-2.5 py-1.5 -mx-0.5 rounded-md border border-indigo-500/20 bg-indigo-950/40 hover:bg-indigo-900/30 hover:border-indigo-400/30 transition-all duration-150 group cursor-pointer mb-1.5">
-                <span className="text-[11px] text-indigo-300/90 uppercase tracking-wider font-mono font-medium flex items-center gap-1.5">
-                  <span className={`text-xs text-indigo-400/70 transition-transform duration-150 inline-block ${collapsedSections.has('sky') ? '' : 'rotate-90'}`}>&#9654;</span>
-                  Sky Background
-                </span>
-                <span className="text-[10px] text-indigo-400/50 font-mono">
-                  {SKY_BACKGROUNDS.find(s => s.id === worldSkyBackground)?.name || 'Procedural Stars'}
-                </span>
-              </button>
-              {!collapsedSections.has('sky') && (
-                <div className="grid grid-cols-2 gap-1.5">
-                  {SKY_BACKGROUNDS.map(sky => {
-                    const isActive = worldSkyBackground === sky.id
-                    return (
-                      <button
-                        key={sky.id}
-                        onClick={() => setWorldSkyBackground(sky.id)}
-                        className={`rounded-lg border px-2 py-1.5 transition-all duration-200 text-left ${
-                          isActive
-                            ? 'border-indigo-500/60 bg-indigo-500/10'
-                            : 'border-gray-700/30 bg-black/40 hover:border-indigo-500/30 hover:bg-indigo-500/5'
-                        }`}
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-sm">{sky.path ? (sky.path.endsWith('.exr') ? '\u{1F30C}' : '\u{1F303}') : '\u2728'}</span>
-                          <span className={`text-[10px] font-medium ${isActive ? 'text-indigo-300' : 'text-gray-400'}`}>
-                            {sky.name}
-                          </span>
-                        </div>
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* ░▒▓█ TERRAIN BRUSH — elevation + texture window █▓▒░ */}
-            <div>
-              <button onClick={() => toggleSection('terrainBrush')} className="w-full flex items-center justify-between px-2.5 py-1.5 -mx-0.5 rounded-md border border-teal-500/20 bg-teal-950/40 hover:bg-teal-900/30 hover:border-teal-400/30 transition-all duration-150 group cursor-pointer mb-1.5">
-                <span className="text-[11px] text-teal-300/90 uppercase tracking-wider font-mono font-medium flex items-center gap-1.5">
-                  <span className={`text-xs text-teal-400/70 transition-transform duration-150 inline-block ${collapsedSections.has('terrainBrush') ? '' : 'rotate-90'}`}>&#9654;</span>
-                  Terrain Brush
-                </span>
-                <span className="text-[10px] text-teal-400/50 font-mono">
-                  {terrainReliefActive ? 'relief active' : `${terrainBrushDirection} ${terrainBrushRadius.toFixed(1)}m`}
-                </span>
-              </button>
-              {!collapsedSections.has('terrainBrush') && (
-                <div className="rounded-lg border border-teal-500/20 bg-black/30 p-2.5 space-y-2">
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <button
-                      onClick={() => { setTerrainBrushPanelOpen(true); setTerrainBrushMode('sculpt') }}
-                      className="rounded-md border border-amber-400/35 bg-amber-400/10 px-2 py-2 text-[10px] font-bold text-amber-200 hover:bg-amber-400/18"
-                    >
-                      Open elevation
-                    </button>
-                    <button
-                      onClick={() => { setTerrainBrushPanelOpen(true); setTerrainBrushMode('texture') }}
-                      className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2 py-2 text-[10px] font-bold text-emerald-200 hover:bg-emerald-400/18"
-                    >
-                      Open texture
-                    </button>
-                  </div>
-                  <div className="flex items-center justify-between text-[9px] font-mono text-teal-100/45">
-                    <span>radius {terrainBrushRadius.toFixed(1)}m</span>
-                    <span>intensity {terrainBrushIntensity.toFixed(1)}/s</span>
-                    <span>{terrainReliefActive ? 'saved relief' : 'flat'}</span>
-                  </div>
-                </div>
-              )}
-            </div>
-
-
-            {/* ░▒▓█ LIGHTS — World illumination controls █▓▒░ */}
-            <div>
-              <button onClick={() => toggleSection('lights')} className="w-full flex items-center justify-between px-2.5 py-1.5 -mx-0.5 rounded-md border border-yellow-500/20 bg-yellow-950/40 hover:bg-yellow-900/30 hover:border-yellow-400/30 transition-all duration-150 group cursor-pointer mb-1.5">
-                <span className="text-[11px] text-yellow-300/90 uppercase tracking-wider font-mono font-medium flex items-center gap-1.5">
-                  <span className={`text-xs text-yellow-400/70 transition-transform duration-150 inline-block ${collapsedSections.has('lights') ? '' : 'rotate-90'}`}>&#9654;</span>
-                  Lights
-                </span>
-                <span className="text-[10px] text-yellow-400/50 font-mono">
-                  {worldLights.length} source{worldLights.length !== 1 ? 's' : ''}
-                </span>
-              </button>
-              {!collapsedSections.has('lights') && (<>
-
-              {/* ── Scene lights: ambient / hemisphere / directional / environment (inline controls) ── */}
-              {worldLights.filter(l => l.type === 'ambient' || l.type === 'hemisphere' || l.type === 'directional' || l.type === 'environment').map(light => {
-                // For directional: derive azimuth/elevation from position vector
-                const pos = light.position || [30, 40, 20]
-                const dist = Math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]) || 50
-                const elevation = Math.asin(Math.min(1, Math.max(-1, pos[1] / dist))) * 180 / Math.PI
-                const azimuth = ((Math.atan2(pos[0], pos[2]) * 180 / Math.PI) + 360) % 360
-
-                return (
-                  <LightTooltipWrap key={light.id} type={light.type} className="relative mb-2">
-                  <div className="p-2 rounded-lg border border-gray-700/30 bg-black/30">
-                    <div className="flex items-center justify-between mb-1.5">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-sm">{light.type === 'ambient' ? '🌫️' : light.type === 'hemisphere' ? '🌗' : light.type === 'environment' ? '🌐' : '☀️'}</span>
-                        <span className="text-[10px] font-medium text-gray-300">
-                          {light.type === 'ambient' ? 'Ambient' : light.type === 'hemisphere' ? 'Hemisphere' : light.type === 'environment' ? 'Environment (IBL)' : 'Sun'}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() => removeWorldLight(light.id)}
-                        className="w-5 h-5 flex items-center justify-center rounded bg-red-500/10 border border-red-500/20 text-red-400/70 hover:bg-red-500/30 hover:text-red-300 hover:border-red-400/40 text-sm font-bold transition-all"
-                        title="Remove light"
-                      >
-                        &#215;
-                      </button>
-                    </div>
-                    <div className="space-y-1.5">
-                      {/* Color (not for environment — IBL uses preset) */}
-                      {light.type !== 'environment' && (
-                      <div className="flex items-center gap-2">
-                        <span className="text-[9px] text-gray-500 font-mono w-10">{light.type === 'hemisphere' ? 'Sky' : 'Color'}</span>
-                        <input
-                          type="color"
-                          value={light.color}
-                          onChange={e => updateWorldLight(light.id, { color: e.target.value })}
-                          className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent"
-                        />
-                        <span className="text-[8px] text-gray-400 font-mono">{light.color}</span>
-                      </div>
-                      )}
-                      {/* Ground color (hemisphere only) */}
-                      {light.type === 'hemisphere' && (
-                        <div className="flex items-center gap-2">
-                          <span className="text-[9px] text-gray-500 font-mono w-10">Gnd</span>
-                          <input
-                            type="color"
-                            value={light.groundColor || '#3a5f0b'}
-                            onChange={e => updateWorldLight(light.id, { groundColor: e.target.value })}
-                            className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent"
-                          />
-                          <span className="text-[8px] text-gray-400 font-mono">{light.groundColor || '#3a5f0b'}</span>
-                        </div>
-                      )}
-                      {/* Intensity — per-type max from LIGHT_INTENSITY_MAX */}
-                      <div className="flex items-center gap-2">
-                        <span className="text-[9px] text-gray-500 font-mono w-10">Int</span>
-                        <input
-                          type="range"
-                          min={0}
-                          max={LIGHT_INTENSITY_MAX[light.type]}
-                          step={LIGHT_INTENSITY_STEP[light.type]}
-                          value={light.intensity}
-                          onChange={e => updateWorldLight(light.id, { intensity: parseFloat(e.target.value) })}
-                          className="flex-1 h-1 accent-yellow-500"
-                        />
-                        <span className="text-[9px] text-yellow-400/70 font-mono w-8 text-right">{light.intensity.toFixed(1)}</span>
-                      </div>
-                      {/* Azimuth + Elevation (directional/sun only) */}
-                      {light.type === 'directional' && (
-                        <>
-                          <div className="flex items-center gap-2">
-                            <span className="text-[9px] text-gray-500 font-mono w-10">Azim</span>
-                            <input
-                              type="range"
-                              min={0}
-                              max={360}
-                              step={1}
-                              value={Math.round(azimuth)}
-                              onChange={e => {
-                                const a = parseFloat(e.target.value) * Math.PI / 180
-                                const el = Math.round(elevation) * Math.PI / 180
-                                const r = 50
-                                updateWorldLight(light.id, { position: [
-                                  r * Math.cos(el) * Math.sin(a),
-                                  r * Math.sin(el),
-                                  r * Math.cos(el) * Math.cos(a),
-                                ] as [number, number, number] })
-                              }}
-                              className="flex-1 h-1 accent-orange-500"
-                            />
-                            <span className="text-[9px] text-orange-400/70 font-mono w-8 text-right">{Math.round(azimuth)}°</span>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-[9px] text-gray-500 font-mono w-10">Elev</span>
-                            <input
-                              type="range"
-                              min={5}
-                              max={90}
-                              step={1}
-                              value={Math.round(elevation)}
-                              onChange={e => {
-                                const el = parseFloat(e.target.value) * Math.PI / 180
-                                const a = Math.round(azimuth) * Math.PI / 180
-                                const r = 50
-                                updateWorldLight(light.id, { position: [
-                                  r * Math.cos(el) * Math.sin(a),
-                                  r * Math.sin(el),
-                                  r * Math.cos(el) * Math.cos(a),
-                                ] as [number, number, number] })
-                              }}
-                              className="flex-1 h-1 accent-orange-500"
-                            />
-                            <span className="text-[9px] text-orange-400/70 font-mono w-8 text-right">{Math.round(elevation)}°</span>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  </LightTooltipWrap>
-                )
-              })}
-
-              {/* Add scene light buttons — with styled HTML tooltips */}
-              <div className="flex gap-1.5 mb-2 flex-wrap">
-                <LightTooltipWrap type="directional" className="relative flex-1">
-                  <button
-                    onClick={() => addWorldLight('directional')}
-                    className="w-full text-[9px] font-mono text-gray-500 hover:text-yellow-300 border border-gray-700/30 hover:border-yellow-500/30 rounded px-2 py-1 transition-colors"
-                  >
-                    + Sun
-                  </button>
-                </LightTooltipWrap>
-                <LightTooltipWrap type="ambient" className="relative flex-1">
-                  <button
-                    onClick={() => addWorldLight('ambient')}
-                    className="w-full text-[9px] font-mono text-gray-500 hover:text-yellow-300 border border-gray-700/30 hover:border-yellow-500/30 rounded px-2 py-1 transition-colors"
-                  >
-                    + Ambient
-                  </button>
-                </LightTooltipWrap>
-                <LightTooltipWrap type="hemisphere" className="relative flex-1">
-                  <button
-                    onClick={() => addWorldLight('hemisphere')}
-                    className="w-full text-[9px] font-mono text-gray-500 hover:text-yellow-300 border border-gray-700/30 hover:border-yellow-500/30 rounded px-2 py-1 transition-colors"
-                  >
-                    + Hemi
-                  </button>
-                </LightTooltipWrap>
-                {!worldLights.some(l => l.type === 'environment') && (
-                  <LightTooltipWrap type="environment" className="relative flex-1">
-                    <button
-                      onClick={() => addWorldLight('environment')}
-                      className="w-full text-[9px] font-mono text-gray-500 hover:text-yellow-300 border border-gray-700/30 hover:border-yellow-500/30 rounded px-2 py-1 transition-colors"
-                    >
-                      + IBL
-                    </button>
-                  </LightTooltipWrap>
-                )}
-              </div>
-
-              {/* ── Positional lights: point / spot (3D-placed orbs) ── */}
-              <div className="text-[9px] text-gray-400 font-mono mb-1">Place in world:</div>
-              <div className="grid grid-cols-2 gap-1.5">
-                {([
-                  { type: 'point' as WorldLightType, icon: '💡', label: 'Point', desc: 'Omni glow' },
-                  { type: 'spot' as WorldLightType, icon: '🔦', label: 'Spot', desc: 'Cone beam' },
-                ]).map(light => (
-                  <LightTooltipWrap key={light.type} type={light.type} className="relative">
-                    <button
-                      onClick={() => addWorldLight(light.type)}
-                      className="w-full rounded-lg border border-gray-700/30 bg-black/40 hover:border-yellow-500/40 hover:bg-yellow-500/5 p-2 transition-all duration-200 text-left group"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-sm">{light.icon}</span>
-                        <div>
-                          <div className="text-[10px] font-medium text-gray-400 group-hover:text-yellow-300 transition-colors">
-                            {light.label}
-                          </div>
-                          <div className="text-[8px] text-gray-400">{light.desc}</div>
-                        </div>
-                      </div>
-                    </button>
-                  </LightTooltipWrap>
-                ))}
-              </div>
-
-              {/* ── Existing positional lights: inline controls ── */}
-              {worldLights.filter(l => l.type === 'point' || l.type === 'spot').map(light => (
-                <LightTooltipWrap key={light.id} type={light.type} className="relative mt-1.5">
-                <div className="p-2 rounded-lg border border-gray-700/30 bg-black/30">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-sm">{light.type === 'point' ? '💡' : '🔦'}</span>
-                      <span className="text-[10px] font-medium text-gray-300">
-                        {light.type === 'point' ? 'Point' : 'Spot'}
-                      </span>
-                      <span className="text-[8px] text-gray-400 font-mono">
-                        ({light.position.map(v => Math.round(v)).join(', ')})
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => removeWorldLight(light.id)}
-                      className="text-[9px] text-red-400/50 hover:text-red-300 font-mono"
-                      title="Remove light"
-                    >
-                      &#215;
-                    </button>
-                  </div>
-                  <div className="space-y-1.5">
-                    {/* Color */}
-                    <div className="flex items-center gap-2">
-                      <span className="text-[9px] text-gray-500 font-mono w-10">Color</span>
-                      <input
-                        type="color"
-                        value={light.color}
-                        onChange={e => updateWorldLight(light.id, { color: e.target.value })}
-                        className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent"
-                      />
-                      <span className="text-[8px] text-gray-400 font-mono">{light.color}</span>
-                    </div>
-                    {/* Intensity — per-type max from LIGHT_INTENSITY_MAX */}
-                    <div className="flex items-center gap-2">
-                      <span className="text-[9px] text-gray-500 font-mono w-10">Int</span>
-                      <input
-                        type="range"
-                        min={0}
-                        max={LIGHT_INTENSITY_MAX[light.type]}
-                        step={LIGHT_INTENSITY_STEP[light.type]}
-                        value={light.intensity}
-                        onChange={e => updateWorldLight(light.id, { intensity: parseFloat(e.target.value) })}
-                        className="flex-1 h-1 accent-yellow-500"
-                      />
-                      <span className="text-[9px] text-yellow-400/70 font-mono w-8 text-right">{light.intensity.toFixed(1)}</span>
-                    </div>
-                    {/* Spot angle + direction (azimuth/elevation) */}
-                    {light.type === 'spot' && (() => {
-                      const tgt = light.target || [0, -1, 0]
-                      const tLen = Math.sqrt(tgt[0] * tgt[0] + tgt[1] * tgt[1] + tgt[2] * tgt[2]) || 1
-                      const spotElev = Math.asin(Math.min(1, Math.max(-1, tgt[1] / tLen))) * 180 / Math.PI
-                      const spotAzim = ((Math.atan2(tgt[0], tgt[2]) * 180 / Math.PI) + 360) % 360
-                      return (<>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[9px] text-gray-500 font-mono w-10">Angle</span>
-                        <input
-                          type="range"
-                          min={5}
-                          max={90}
-                          step={1}
-                          value={light.angle ?? 45}
-                          onChange={e => updateWorldLight(light.id, { angle: parseFloat(e.target.value) })}
-                          className="flex-1 h-1 accent-orange-500"
-                        />
-                        <span className="text-[9px] text-orange-400/70 font-mono w-8 text-right">{Math.round(light.angle ?? 45)}°</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[9px] text-gray-500 font-mono w-10">Azim</span>
-                        <input
-                          type="range"
-                          min={0}
-                          max={360}
-                          step={1}
-                          value={Math.round(spotAzim)}
-                          onChange={e => {
-                            const a = parseFloat(e.target.value) * Math.PI / 180
-                            const el = Math.round(spotElev) * Math.PI / 180
-                            updateWorldLight(light.id, { target: [
-                              Math.cos(el) * Math.sin(a),
-                              Math.sin(el),
-                              Math.cos(el) * Math.cos(a),
-                            ] as [number, number, number] })
-                          }}
-                          className="flex-1 h-1 accent-orange-500"
-                        />
-                        <span className="text-[9px] text-orange-400/70 font-mono w-8 text-right">{Math.round(spotAzim)}°</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[9px] text-gray-500 font-mono w-10">Elev</span>
-                        <input
-                          type="range"
-                          min={-90}
-                          max={90}
-                          step={1}
-                          value={Math.round(spotElev)}
-                          onChange={e => {
-                            const el = parseFloat(e.target.value) * Math.PI / 180
-                            const a = Math.round(spotAzim) * Math.PI / 180
-                            updateWorldLight(light.id, { target: [
-                              Math.cos(el) * Math.sin(a),
-                              Math.sin(el),
-                              Math.cos(el) * Math.cos(a),
-                            ] as [number, number, number] })
-                          }}
-                          className="flex-1 h-1 accent-orange-500"
-                        />
-                        <span className="text-[9px] text-orange-400/70 font-mono w-8 text-right">{Math.round(spotElev)}°</span>
-                      </div>
-                      </>)
-                    })()}
-                  </div>
-                </div>
-                </LightTooltipWrap>
-              ))}
-              </>)}
-            </div>
-
+            <EnvironmentTab />
 
             {/* ░▒▓█ WORLD IMPORT/EXPORT █▓▒░ */}
             <div className="flex gap-2 pt-2 border-t border-gray-800/50">
@@ -2518,7 +2149,7 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
                 setPreviewAsset(null)
               }}
               accentColor="#EAB308"
-              canvasHeight={400}
+              canvasHeight={260}
             />
           ) : previewConjured ? (
             /* ░▒▓█ 3D PREVIEW — Conjured GLB model █▓▒░ */
@@ -2571,69 +2202,31 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
             />
           ) : (
           <>
-            {/* ═══════════════════════════════════════════════════════════════════
-                SUB-TAB BAR — Catalog / Conjured / Crafted
-                ─═̷─═̷─ Three galleries under one roof ─═̷─═̷─
-                ═══════════════════════════════════════════════════════════════════ */}
-            <div className="flex items-center gap-1 mb-2">
-              {([
-                { key: 'catalog' as const, label: 'Catalog', count: ASSET_CATALOG.length, color: 'yellow' },
-                { key: 'portals' as const, label: 'Portals', count: PORTAL_GATE_VARIANT_DEFS.length, color: 'cyan' },
-                { key: 'spatial' as const, label: 'Functional', count: SPATIAL_WEB_ASSET_TEMPLATES.length, color: 'cyan' },
-                { key: 'conjured' as const, label: 'Conjured', count: conjuredAssets.filter(a => a.status === 'ready').length, color: 'orange' },
-                { key: 'crafted' as const, label: 'Crafted', count: sceneLibrary.length, color: 'blue' },
-                { key: 'images' as const, label: 'Images', count: generatedImages.length, color: 'pink' },
-              ]).map(tab => (
-                <button
-                  key={tab.key}
-                  onClick={() => setAssetSubTab(tab.key)}
-                  className={`text-[10px] px-2 py-0.5 rounded font-mono transition-colors ${
-                    assetSubTab === tab.key
-                      ? `bg-${tab.color}-500/20 text-${tab.color}-300 border border-${tab.color}-500/40`
-                      : 'text-gray-400 border border-gray-700/30 hover:text-gray-200 hover:border-gray-600/50'
-                  }`}
-                  style={assetSubTab === tab.key ? {
-                    background: tab.color === 'yellow' ? 'rgba(234,179,8,0.15)' : tab.color === 'orange' ? 'rgba(249,115,22,0.15)' : tab.color === 'pink' ? 'rgba(236,72,153,0.15)' : tab.color === 'cyan' ? 'rgba(34,211,238,0.15)' : 'rgba(59,130,246,0.15)',
-                    color: tab.color === 'yellow' ? '#FDE047' : tab.color === 'orange' ? '#FB923C' : tab.color === 'pink' ? '#F9A8D4' : tab.color === 'cyan' ? '#67E8F9' : '#93C5FD',
-                    borderColor: tab.color === 'yellow' ? 'rgba(234,179,8,0.4)' : tab.color === 'orange' ? 'rgba(249,115,22,0.4)' : tab.color === 'pink' ? 'rgba(236,72,153,0.4)' : tab.color === 'cyan' ? 'rgba(34,211,238,0.4)' : 'rgba(59,130,246,0.4)',
-                  } : {}}
-                >
-                  {tab.label}
-                  {tab.count > 0 && (
-                    <span className="ml-1 opacity-60">{tab.count}</span>
-                  )}
-                </button>
-              ))}
+            {/* ░▒▓ ONE ROW OF SMALL CATEGORIES — the catalog's, then Portals and Functional (owner, 13:15).
+                Conjured, Crafted and Images left the catalog: they live in Conjuring, Crafting and Media. ▓▒░ */}
+            <div className="mb-2">
+              <CatalogCategories
+                items={[
+                  ...['all', ...Array.from(new Set(ASSET_CATALOG.map(a => a.category)))].map(cat => ({
+                    id: `cat:${cat}`,
+                    label: cat === 'all' ? 'all' : cat.replace(/-/g, ' '),
+                    count: cat === 'all' ? ASSET_CATALOG.length : ASSET_CATALOG.filter(a => a.category === cat).length,
+                  })),
+                  { id: 'portals', label: 'portals', count: PORTAL_GATE_VARIANT_DEFS.length, title: 'Gates to other worlds', special: true },
+                  { id: 'spatial', label: 'functional', count: SPATIAL_WEB_ASSET_TEMPLATES.length, title: 'Buttons, sliders, text and panels that work in 3D', special: true },
+                ]}
+                active={assetSubTab === 'portals' || assetSubTab === 'spatial' ? assetSubTab : `cat:${assetCategory}`}
+                onChange={id => {
+                  if (id === 'portals' || id === 'spatial') { setAssetSubTab(id); return }
+                  setAssetSubTab('catalog')
+                  setAssetCategory(id.slice(4))
+                }}
+              />
             </div>
 
             {/* ░▒▓ CATALOG SUB-TAB — Pre-made Quaternius models ▓▒░ */}
             {assetSubTab === 'catalog' && (
               <>
-                {/* Category filter pills + generate thumbs button */}
-                <div className="flex flex-wrap gap-1 mb-2 items-center">
-                  {['all', ...Array.from(new Set(ASSET_CATALOG.map(a => a.category)))].map(cat => (
-                    <button
-                      key={cat}
-                      onClick={() => setAssetCategory(cat)}
-                      className={`text-[10px] px-1.5 py-0.5 rounded font-mono transition-colors ${
-                        assetCategory === cat
-                          ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/40'
-                          : 'text-gray-400 border border-gray-700/30 hover:text-gray-200 hover:border-gray-600/50'
-                      }`}
-                    >
-                      {cat}
-                    </button>
-                  ))}
-                  <div className="ml-auto">
-                    <RegenAllButton
-                      onClick={() => catalogThumbGen.generate()}
-                      running={catalogThumbGen.running}
-                      done={catalogThumbGen.done}
-                      total={catalogThumbGen.total}
-                    />
-                  </div>
-                </div>
-
                 {/* Catalog grid — unified AssetCard */}
                 <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${colsCatalog}, minmax(0, 1fr))` }}>
                   {ASSET_CATALOG
@@ -2648,7 +2241,8 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
                       fallbackThumbnailUrl={catalogFallbackThumbnail(asset.category)}
                       modelUrl={asset.path}
                       subtitle={asset.category}
-                      onClick={() => {
+                      onClick={() => enterPlacementMode({ type: 'catalog', catalogId: asset.id, name: asset.name, path: asset.path, defaultScale: asset.defaultScale })}
+                      onInfo={() => {
                         if (scrollRef.current) savedScrollTop.current = scrollRef.current.scrollTop
                         setPreviewAsset(asset)
                       }}
@@ -3550,14 +3144,7 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
         )}
       </div>
 
-      {/* ─═̷─═̷─ RESIZE HANDLE ─═̷─═̷─ */}
-      <div
-        className="resize-handle absolute bottom-0 right-0 w-4 h-4 cursor-se-resize flex-shrink-0"
-        onMouseDown={handleResizeStart}
-        style={{
-          background: `linear-gradient(135deg, transparent 50%, ${forgeColor}44 50%)`,
-        }}
-      />
+      </div>
 
       <DeleteConfirmModal
         isOpen={!!deleteConfirm}
@@ -3573,7 +3160,7 @@ export function WizardConsole({ isOpen, onClose, variant = 'local', initialTab }
       {assetsLightboxUrl && (
         <MediaLightbox url={assetsLightboxUrl} onClose={() => setAssetsLightboxUrl(null)} />
       )}
-    </div>,
+    </KitPanel>,
     document.body
   )
 }
